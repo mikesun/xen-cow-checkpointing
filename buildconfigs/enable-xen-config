@@ -1,0 +1,48 @@
+#!/bin/sh
+
+set -e
+
+if [ $# -ne 1 ] ; then
+	echo "Usage $(basename $0) <config-file>" 1>&2
+	exit 1
+fi
+
+CONFIG=$1
+
+setopt()
+{
+	OPTION=$1
+	VALUE=$2
+
+	# First remove any existing instances of this option
+	sed -e "s/^# ${OPTION} is not set$//g ; s/^^{OPTION}=.$//g" -i "${CONFIG}"
+
+	# Then append the new value
+	case ${VALUE} in
+	    y|m) echo "${OPTION}=${VALUE}" >> "${CONFIG}" ;;
+	    n)   echo "# ${OPTION} is not set" >> "${CONFIG}" ;;
+	    *)   echo "Invalid value ${VALUE} for ${OPTION}" 1>&2 ; exit 1 ;;
+	esac
+}
+
+setopt CONFIG_PARAVIRT y
+setopt CONFIG_PARAVIRT_GUEST y
+setopt CONFIG_XEN y
+setopt CONFIG_VMI y
+setopt CONFIG_KVM y
+setopt CONFIG_KVM_INTEL y
+setopt CONFIG_KVM_AMD y
+setopt CONFIG_LGUEST n
+setopt CONFIG_XEN_BLKDEV_FRONTEND y
+setopt CONFIG_XEN_NETDEV_FRONTEND y
+setopt CONFIG_HVC_XEN y
+setopt CONFIG_NUMA n
+setopt CONFIG_LOCALVERSION_AUTO n
+
+case ${XEN_TARGET_ARCH} in
+    x86_32) setopt CONFIG_64BIT n ;;
+    x86_64) setopt CONFIG_64BIT y ;;
+    *) ;;
+esac
+
+exit 0

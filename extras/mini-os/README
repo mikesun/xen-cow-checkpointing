@@ -1,0 +1,30 @@
+ Minimal OS
+ ----------
+
+This shows some of the stuff that any guest OS will have to set up.
+
+This includes:
+
+ * installing a virtual exception table
+ * handling virtual exceptions
+ * handling asynchronous events
+ * enabling/disabling async events
+ * parsing start_info struct at start-of-day
+ * registering virtual interrupt handlers (for timer interrupts)
+ * a simple page and memory allocator
+ * minimal libc support
+
+Stuff it doesn't show:
+ 
+ * modifying page tables
+ * network code
+ * block-device code
+
+
+- to build it just type make.
+
+- to start it do the following in domain0 (assuming xend is running)
+  # xm create domain_config
+
+this starts the kernel and prints out a bunch of stuff and then once
+every second the system time.

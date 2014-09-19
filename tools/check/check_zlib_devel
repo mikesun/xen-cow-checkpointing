@@ -1,0 +1,14 @@
+#!/bin/sh
+# CHECK-BUILD
+
+RC=0
+
+set -e
+test -r /usr/include/zlib.h || RC=1
+
+if test ${RC} -ne 0; then
+	echo
+	echo " *** Check for zlib headers FAILED"
+fi 
+
+exit ${RC}

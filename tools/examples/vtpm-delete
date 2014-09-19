@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# This scripts must be called the following way:
+# vtpm-delete <domain name>
+
+dir=$(dirname "$0")
+. "$dir/vtpm-common.sh"
+
+vtpm_delete_instance $1

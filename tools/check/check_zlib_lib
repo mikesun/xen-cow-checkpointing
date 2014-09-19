@@ -1,0 +1,24 @@
+#!/bin/sh
+# CHECK-BUILD CHECK-INSTALL
+
+RC=0
+
+case $(uname -s) in
+FreeBSD|NetBSD|OpenBSD)
+	exit 0
+	;;
+*)
+	;;
+esac
+
+PATH=/sbin:$PATH
+
+set -e
+ldconfig -p 2>&1 | grep -q libz.so || RC=1
+
+if test ${RC} -ne 0; then
+	echo
+	echo " *** Check for zlib library FAILED"
+fi
+
+exit ${RC} 

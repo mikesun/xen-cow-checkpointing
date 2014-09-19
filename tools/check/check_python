@@ -1,0 +1,16 @@
+#!/bin/sh
+# CHECK-BUILD CHECK-INSTALL
+
+RC=0
+
+python -c '
+import sys
+sys.exit(sys.version_info[0] < 2 or sys.version_info[1] < 2)
+' || RC=1
+
+if test ${RC} -ne 0; then
+	echo
+	echo " *** Check for Python version >= 2.2 FAILED"
+fi
+
+exit ${RC} 
