@@ -1,6 +1,8 @@
 /******************************************************************************
  * xc_linux_save.c
  *
+ * Modified for CoW by Mike Sun.
+ *
  * Save the state of a running Linux session.
  *
  * Copyright (c) 2003, K A Fraser.
@@ -11,24 +13,16 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/time.h>
-
 #include "xc_private.h"
 #include "xc_dom.h"
 #include "xg_private.h"
 #include "xg_save_restore.h"
-
 #include <xen/hvm/params.h>
 #include "xc_e820.h"
 
-/*
-** Default values for important tuning parameters. Can override by passing
-** non-zero replacement values to xc_domain_save().
-**
-** XXX SMH: should consider if want to be able to override MAX_MBIT_RATE too.
-**
-*/
-#define DEF_MAX_ITERS   29   /* limit us to 30 times round loop   */
-#define DEF_MAX_FACTOR   3   /* never send more than 3x p2m_size  */
+
+/* file descriptor */
+int fd;
 
 /* max mfn of the whole machine */
 static unsigned long max_mfn;
@@ -36,7 +30,7 @@ static unsigned long max_mfn;
 /* virtual starting address of the hypervisor */
 static unsigned long hvirt_start;
 
-/* #levels of page tables used by the current guest */
+/* # levels of page tables used by the current guest */
 static unsigned int pt_levels;
 
 /* HVM: shared-memory bitmaps for getting log-dirty bits from qemu-dm */
@@ -76,11 +70,6 @@ unsigned int guest_width;
      ((mfn_to_pfn(_mfn) < (p2m_size)) &&        \
       (pfn_to_mfn(mfn_to_pfn(_mfn)) == (_mfn))))
 
-/*
-** During (live) save/migrate, we maintain a number of bitmaps to track
-** which pages we have to send, to fixup, and to skip.
-*/
-
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
 #define BITS_TO_LONGS(bits) (((bits)+BITS_PER_LONG-1)/BITS_PER_LONG)
 #define BITMAP_SIZE   (BITS_TO_LONGS(p2m_size) * sizeof(unsigned long))
@@ -105,45 +94,7 @@ static inline void set_bit ( int nr, volatile void * addr)
     BITMAP_ENTRY(nr, addr) |= (1UL << BITMAP_SHIFT(nr));
 }
 
-/* Returns the hamming weight (i.e. the number of bits set) in a N-bit word */
-static inline unsigned int hweight32(unsigned int w)
-{
-    unsigned int res = (w & 0x55555555) + ((w >> 1) & 0x55555555);
-    res = (res & 0x33333333) + ((res >> 2) & 0x33333333);
-    res = (res & 0x0F0F0F0F) + ((res >> 4) & 0x0F0F0F0F);
-    res = (res & 0x00FF00FF) + ((res >> 8) & 0x00FF00FF);
-    return (res & 0x0000FFFF) + ((res >> 16) & 0x0000FFFF);
-}
-
-static inline int count_bits ( int nr, volatile void *addr)
-{
-    int i, count = 0;
-    volatile unsigned long *p = (volatile unsigned long *)addr;
-    /* We know that the array is padded to unsigned long. */
-    for ( i = 0; i < (nr / (sizeof(unsigned long)*8)); i++, p++ )
-        count += hweight32(*p);
-    return count;
-}
-
-static uint64_t tv_to_us(struct timeval *new)
-{
-    return (new->tv_sec * 1000000) + new->tv_usec;
-}
-
-static uint64_t llgettimeofday(void)
-{
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    return tv_to_us(&now);
-}
-
-static uint64_t tv_delta(struct timeval *new, struct timeval *old)
-{
-    return (((new->tv_sec - old->tv_sec)*1000000) +
-            (new->tv_usec - old->tv_usec));
-}
-
-static int noncached_write(int fd, int live, void *buffer, int len) 
+static int noncached_write(int fd, void *buffer, int len) 
 {
     static int write_count = 0;
     int rc = (write_exact(fd, buffer, len) == 0) ? len : -1;
@@ -155,189 +106,10 @@ static int noncached_write(int fd, int live, void *buffer, int len)
         discard_file_cache(fd, 0 /* no flush */);
         write_count = 0;
     }
-
     return rc;
 }
 
-#ifdef ADAPTIVE_SAVE
-
-/*
-** We control the rate at which we transmit (or save) to minimize impact
-** on running domains (including the target if we're doing live migrate).
-*/
-
-#define MAX_MBIT_RATE    500      /* maximum transmit rate for migrate */
-#define START_MBIT_RATE  100      /* initial transmit rate for migrate */
-
-/* Scaling factor to convert between a rate (in Mb/s) and time (in usecs) */
-#define RATE_TO_BTU      781250
-
-/* Amount in bytes we allow ourselves to send in a burst */
-#define BURST_BUDGET (100*1024)
-
-/* We keep track of the current and previous transmission rate */
-static int mbit_rate, ombit_rate = 0;
-
-/* Have we reached the maximum transmission rate? */
-#define RATE_IS_MAX() (mbit_rate == MAX_MBIT_RATE)
-
-static inline void initialize_mbit_rate()
-{
-    mbit_rate = START_MBIT_RATE;
-}
-
-static int ratewrite(int io_fd, int live, void *buf, int n)
-{
-    static int budget = 0;
-    static int burst_time_us = -1;
-    static struct timeval last_put = { 0 };
-    struct timeval now;
-    struct timespec delay;
-    long long delta;
-
-    if ( START_MBIT_RATE == 0 )
-        return noncached_write(io_fd, live, buf, n);
-
-    budget -= n;
-    if ( budget < 0 )
-    {
-        if ( mbit_rate != ombit_rate )
-        {
-            burst_time_us = RATE_TO_BTU / mbit_rate;
-            ombit_rate = mbit_rate;
-            DPRINTF("rate limit: %d mbit/s burst budget %d slot time %d\n",
-                    mbit_rate, BURST_BUDGET, burst_time_us);
-        }
-        if ( last_put.tv_sec == 0 )
-        {
-            budget += BURST_BUDGET;
-            gettimeofday(&last_put, NULL);
-        }
-        else
-        {
-            while ( budget < 0 )
-            {
-                gettimeofday(&now, NULL);
-                delta = tv_delta(&now, &last_put);
-                while ( delta > burst_time_us )
-                {
-                    budget += BURST_BUDGET;
-                    last_put.tv_usec += burst_time_us;
-                    if ( last_put.tv_usec > 1000000 )
-                    {
-                        last_put.tv_usec -= 1000000;
-                        last_put.tv_sec++;
-                    }
-                    delta -= burst_time_us;
-                }
-                if ( budget > 0 )
-                    break;
-                delay.tv_sec = 0;
-                delay.tv_nsec = 1000 * (burst_time_us - delta);
-                while ( delay.tv_nsec > 0 )
-                    if ( nanosleep(&delay, &delay) == 0 )
-                        break;
-            }
-        }
-    }
-    return noncached_write(io_fd, live, buf, n);
-}
-
-#else /* ! ADAPTIVE SAVE */
-
-#define RATE_IS_MAX() (0)
-#define ratewrite(_io_fd, _live, _buf, _n) noncached_write((_io_fd), (_live), (_buf), (_n))
-#define initialize_mbit_rate()
-
-#endif
-
-static int print_stats(int xc_handle, uint32_t domid, int pages_sent,
-                       xc_shadow_op_stats_t *stats, int print)
-{
-    static struct timeval wall_last;
-    static long long      d0_cpu_last;
-    static long long      d1_cpu_last;
-
-    struct timeval        wall_now;
-    long long             wall_delta;
-    long long             d0_cpu_now, d0_cpu_delta;
-    long long             d1_cpu_now, d1_cpu_delta;
-
-    gettimeofday(&wall_now, NULL);
-
-    d0_cpu_now = xc_domain_get_cpu_usage(xc_handle, 0, /* FIXME */ 0)/1000;
-    d1_cpu_now = xc_domain_get_cpu_usage(xc_handle, domid, /* FIXME */ 0)/1000;
-
-    if ( (d0_cpu_now == -1) || (d1_cpu_now == -1) )
-        DPRINTF("ARRHHH!!\n");
-
-    wall_delta = tv_delta(&wall_now,&wall_last)/1000;
-    if ( wall_delta == 0 )
-        wall_delta = 1;
-
-    d0_cpu_delta = (d0_cpu_now - d0_cpu_last)/1000;
-    d1_cpu_delta = (d1_cpu_now - d1_cpu_last)/1000;
-
-    if ( print )
-        DPRINTF("delta %lldms, dom0 %d%%, target %d%%, sent %dMb/s, "
-                "dirtied %dMb/s %" PRId32 " pages\n",
-                wall_delta,
-                (int)((d0_cpu_delta*100)/wall_delta),
-                (int)((d1_cpu_delta*100)/wall_delta),
-                (int)((pages_sent*PAGE_SIZE)/(wall_delta*(1000/8))),
-                (int)((stats->dirty_count*PAGE_SIZE)/(wall_delta*(1000/8))),
-                stats->dirty_count);
-
-#ifdef ADAPTIVE_SAVE
-    if ( ((stats->dirty_count*PAGE_SIZE)/(wall_delta*(1000/8))) > mbit_rate )
-    {
-        mbit_rate = (int)((stats->dirty_count*PAGE_SIZE)/(wall_delta*(1000/8)))
-            + 50;
-        if ( mbit_rate > MAX_MBIT_RATE )
-            mbit_rate = MAX_MBIT_RATE;
-    }
-#endif
-
-    d0_cpu_last = d0_cpu_now;
-    d1_cpu_last = d1_cpu_now;
-    wall_last   = wall_now;
-
-    return 0;
-}
-
-
-static int analysis_phase(int xc_handle, uint32_t domid, int p2m_size,
-                          unsigned long *arr, int runs)
-{
-    long long start, now;
-    xc_shadow_op_stats_t stats;
-    int j;
-
-    start = llgettimeofday();
-
-    for ( j = 0; j < runs; j++ )
-    {
-        int i;
-
-        xc_shadow_control(xc_handle, domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
-                          arr, p2m_size, NULL, 0, NULL);
-        DPRINTF("#Flush\n");
-        for ( i = 0; i < 40; i++ )
-        {
-            usleep(50000);
-            now = llgettimeofday();
-            xc_shadow_control(xc_handle, domid, XEN_DOMCTL_SHADOW_OP_PEEK,
-                              NULL, 0, NULL, 0, &stats);
-            DPRINTF("now= %lld faults= %"PRId32" dirty= %"PRId32"\n",
-                    ((now-start)+500)/1000,
-                    stats.fault_count, stats.dirty_count);
-        }
-    }
-
-    return -1;
-}
-
-
+/* Can we just pause this? */
 static int suspend_and_state(int (*suspend)(int), int xc_handle, int io_fd,
                              int dom, xc_dominfo_t *info)
 {
@@ -373,15 +145,15 @@ static int suspend_and_state(int (*suspend)(int), int xc_handle, int io_fd,
     {
         switch ( info->shutdown_reason )
         {
-        case SHUTDOWN_poweroff:
-        case SHUTDOWN_reboot:
-            ERROR("domain has shut down");
-            return -1;
-        case SHUTDOWN_suspend:
-            return 0;
-        case SHUTDOWN_crash:
-            ERROR("domain has crashed");
-            return -1;
+            case SHUTDOWN_poweroff:
+            case SHUTDOWN_reboot:
+                ERROR("domain has shut down");
+                return -1;
+            case SHUTDOWN_suspend:
+                return 0;
+            case SHUTDOWN_crash:
+                ERROR("domain has crashed");
+                return -1;
         }
     }
 
@@ -406,35 +178,18 @@ static int suspend_and_state(int (*suspend)(int), int xc_handle, int io_fd,
     return -1;
 }
 
-/*
-** Map the top-level page of MFNs from the guest. The guest might not have
-** finished resuming from a previous restore operation, so we wait a while for
-** it to update the MFN to a reasonable value.
-*/
-static void *map_frame_list_list(int xc_handle, uint32_t dom,
-                                 shared_info_either_t *shinfo)
+static int restart_and_state(int (*restart)(int), int xc_handle, int io_fd,
+                             int dom, xc_dominfo_t *info)
 {
-    int count = 100;
-    void *p;
-    uint64_t fll = GET_FIELD(shinfo, arch.pfn_to_mfn_frame_list_list);
-
-    while ( count-- && (fll == 0) )
+    if ( !(*restart)(dom) )
     {
-        usleep(10000);
-        fll = GET_FIELD(shinfo, arch.pfn_to_mfn_frame_list_list);
+        ERROR("Restart request failed");
+        return -1;
     }
+    usleep(1000000); /* 1s */
 
-    if ( fll == 0 )
-    {
-        ERROR("Timed out waiting for frame list updated.");
-        return NULL;
-    }
-
-    p = xc_map_foreign_range(xc_handle, dom, PAGE_SIZE, PROT_READ, fll);
-    if ( p == NULL )
-        ERROR("Couldn't map p2m_frame_list_list (errno %d)", errno);
-
-    return p;
+    /* FIX */
+    return 0;
 }
 
 /*
@@ -452,6 +207,8 @@ static int canonicalize_pagetable(unsigned long type, unsigned long pfn,
 
     int i, pte_last, xen_start, xen_end, race = 0; 
     uint64_t pte;
+
+    DPRINTF("canonicalize_pagetable()\n");
 
     /*
     ** We need to determine which entries in this page table hold
@@ -519,6 +276,7 @@ static int canonicalize_pagetable(unsigned long type, unsigned long pfn,
 
         if ( pte & _PAGE_PRESENT )
         {
+            DPRINTF("page present in canonicalize\n");
             mfn = (pte >> PAGE_SHIFT) & MFN_MASK_X86;
             if ( !MFN_IS_IN_PSEUDOPHYS_MAP(mfn) )
             {
@@ -555,1073 +313,566 @@ static int canonicalize_pagetable(unsigned long type, unsigned long pfn,
         else
             ((uint64_t*)dpage)[i] = pte;
     }
+    if (memcmp(spage, dpage, PAGE_SIZE) == 0)
+        DPRINTF("Canonicalized pages are same\n");
 
     return race;
 }
 
-static xen_pfn_t *xc_map_m2p(int xc_handle,
-                                 unsigned long max_mfn,
-                                 int prot)
-{
-    struct xen_machphys_mfn_list xmml;
-    privcmd_mmap_entry_t *entries;
-    unsigned long m2p_chunks, m2p_size;
-    xen_pfn_t *m2p;
-    xen_pfn_t *extent_start;
-    int i, rc;
-
-    m2p_size   = M2P_SIZE(max_mfn);
-    m2p_chunks = M2P_CHUNKS(max_mfn);
-
-    xmml.max_extents = m2p_chunks;
-    if ( !(extent_start = malloc(m2p_chunks * sizeof(xen_pfn_t))) )
-    {
-        ERROR("failed to allocate space for m2p mfns");
-        return NULL;
-    }
-    set_xen_guest_handle(xmml.extent_start, extent_start);
-
-    if ( xc_memory_op(xc_handle, XENMEM_machphys_mfn_list, &xmml) ||
-         (xmml.nr_extents != m2p_chunks) )
-    {
-        ERROR("xc_get_m2p_mfns");
-        return NULL;
-    }
-
-    if ( (m2p = mmap(NULL, m2p_size, prot,
-                     MAP_SHARED, xc_handle, 0)) == MAP_FAILED )
-    {
-        ERROR("failed to mmap m2p");
-        return NULL;
-    }
-
-    if ( !(entries = malloc(m2p_chunks * sizeof(privcmd_mmap_entry_t))) )
-    {
-        ERROR("failed to allocate space for mmap entries");
-        return NULL;
-    }
-
-    for ( i = 0; i < m2p_chunks; i++ )
-    {
-        entries[i].va = (unsigned long)(((void *)m2p) + (i * M2P_CHUNK_SIZE));
-        entries[i].mfn = extent_start[i];
-        entries[i].npages = M2P_CHUNK_SIZE >> PAGE_SHIFT;
-    }
-
-    if ( (rc = xc_map_foreign_ranges(xc_handle, DOMID_XEN,
-                                     entries, m2p_chunks)) < 0 )
-    {
-        ERROR("xc_mmap_foreign_ranges failed (rc = %d)", rc);
-        return NULL;
-    }
-
-    m2p_mfn0 = entries[0].mfn;
-
-    free(extent_start);
-    free(entries);
-
-    return m2p;
-}
-
-
-static xen_pfn_t *map_and_save_p2m_table(int xc_handle, 
-                                         int io_fd, 
-                                         uint32_t dom,
-                                         unsigned long p2m_size,
-                                         shared_info_either_t *live_shinfo)
-{
-    vcpu_guest_context_either_t ctxt;
-
-    /* Double and single indirect references to the live P2M table */
-    void *live_p2m_frame_list_list = NULL;
-    void *live_p2m_frame_list = NULL;
-
-    /* Copies of the above. */
-    xen_pfn_t *p2m_frame_list_list = NULL;
-    xen_pfn_t *p2m_frame_list = NULL;
-
-    /* The mapping of the live p2m table itself */
-    xen_pfn_t *p2m = NULL;
-
-    int i, success = 0;
-
-    live_p2m_frame_list_list = map_frame_list_list(xc_handle, dom,
-                                                   live_shinfo);
-    if ( !live_p2m_frame_list_list )
-        goto out;
-
-    /* Get a local copy of the live_P2M_frame_list_list */
-    if ( !(p2m_frame_list_list = malloc(PAGE_SIZE)) )
-    {
-        ERROR("Couldn't allocate p2m_frame_list_list array");
-        goto out;
-    }
-    memcpy(p2m_frame_list_list, live_p2m_frame_list_list, PAGE_SIZE);
-
-    /* Canonicalize guest's unsigned long vs ours */
-    if ( guest_width > sizeof(unsigned long) )
-        for ( i = 0; i < PAGE_SIZE/sizeof(unsigned long); i++ )
-            if ( i < PAGE_SIZE/guest_width )
-                p2m_frame_list_list[i] = ((uint64_t *)p2m_frame_list_list)[i];
-            else
-                p2m_frame_list_list[i] = 0;
-    else if ( guest_width < sizeof(unsigned long) )
-        for ( i = PAGE_SIZE/sizeof(unsigned long) - 1; i >= 0; i-- )
-            p2m_frame_list_list[i] = ((uint32_t *)p2m_frame_list_list)[i];
-
-    live_p2m_frame_list =
-        xc_map_foreign_batch(xc_handle, dom, PROT_READ,
-                             p2m_frame_list_list,
-                             P2M_FLL_ENTRIES);
-    if ( !live_p2m_frame_list )
-    {
-        ERROR("Couldn't map p2m_frame_list");
-        goto out;
-    }
-
-    /* Get a local copy of the live_P2M_frame_list */
-    if ( !(p2m_frame_list = malloc(P2M_TOOLS_FL_SIZE)) )
-    {
-        ERROR("Couldn't allocate p2m_frame_list array");
-        goto out;
-    }
-    memset(p2m_frame_list, 0, P2M_TOOLS_FL_SIZE);
-    memcpy(p2m_frame_list, live_p2m_frame_list, P2M_GUEST_FL_SIZE);
-
-    /* Canonicalize guest's unsigned long vs ours */
-    if ( guest_width > sizeof(unsigned long) )
-        for ( i = 0; i < P2M_FL_ENTRIES; i++ )
-            p2m_frame_list[i] = ((uint64_t *)p2m_frame_list)[i];
-    else if ( guest_width < sizeof(unsigned long) )
-        for ( i = P2M_FL_ENTRIES - 1; i >= 0; i-- )
-            p2m_frame_list[i] = ((uint32_t *)p2m_frame_list)[i];
-
-
-    /* Map all the frames of the pfn->mfn table. For migrate to succeed,
-       the guest must not change which frames are used for this purpose.
-       (its not clear why it would want to change them, and we'll be OK
-       from a safety POV anyhow. */
-
-    p2m = xc_map_foreign_batch(xc_handle, dom, PROT_READ,
-                               p2m_frame_list,
-                               P2M_FL_ENTRIES);
-    if ( !p2m )
-    {
-        ERROR("Couldn't map p2m table");
-        goto out;
-    }
-    live_p2m = p2m; /* So that translation macros will work */
-    
-    /* Canonicalise the pfn-to-mfn table frame-number list. */
-    for ( i = 0; i < p2m_size; i += FPP )
-    {
-        if ( !MFN_IS_IN_PSEUDOPHYS_MAP(p2m_frame_list[i/FPP]) )
-        {
-            ERROR("Frame# in pfn-to-mfn frame list is not in pseudophys");
-            ERROR("entry %d: p2m_frame_list[%ld] is 0x%"PRIx64", max 0x%lx",
-                  i, i/FPP, (uint64_t)p2m_frame_list[i/FPP], max_mfn);
-            if ( p2m_frame_list[i/FPP] < max_mfn ) 
-            {
-                ERROR("m2p[0x%"PRIx64"] = 0x%"PRIx64, 
-                      (uint64_t)p2m_frame_list[i/FPP],
-                      (uint64_t)live_m2p[p2m_frame_list[i/FPP]]);
-                ERROR("p2m[0x%"PRIx64"] = 0x%"PRIx64, 
-                      (uint64_t)live_m2p[p2m_frame_list[i/FPP]],
-                      (uint64_t)p2m[live_m2p[p2m_frame_list[i/FPP]]]);
-
-            }
-            goto out;
-        }
-        p2m_frame_list[i/FPP] = mfn_to_pfn(p2m_frame_list[i/FPP]);
-    }
-
-    if ( xc_vcpu_getcontext(xc_handle, dom, 0, &ctxt.c) )
-    {
-        ERROR("Could not get vcpu context");
-        goto out;
-    }
-
-    /*
-     * Write an extended-info structure to inform the restore code that
-     * a PAE guest understands extended CR3 (PDPTs above 4GB). Turns off
-     * slow paths in the restore code.
-     */
-    {
-        unsigned long signature = ~0UL;
-        uint32_t chunk1_sz = ((guest_width==8) 
-                              ? sizeof(ctxt.x64) 
-                              : sizeof(ctxt.x32));
-        uint32_t chunk2_sz = 0;
-        uint32_t tot_sz    = (chunk1_sz + 8) + (chunk2_sz + 8);
-        if ( write_exact(io_fd, &signature, sizeof(signature)) ||
-             write_exact(io_fd, &tot_sz, sizeof(tot_sz)) ||
-             write_exact(io_fd, "vcpu", 4) ||
-             write_exact(io_fd, &chunk1_sz, sizeof(chunk1_sz)) ||
-             write_exact(io_fd, &ctxt, chunk1_sz) ||
-             write_exact(io_fd, "extv", 4) ||
-             write_exact(io_fd, &chunk2_sz, sizeof(chunk2_sz)) )
-        {
-            PERROR("write: extended info");
-            goto out;
-        }
-    }
-
-    if ( write_exact(io_fd, p2m_frame_list, 
-                     P2M_FL_ENTRIES * sizeof(xen_pfn_t)) )
-    {
-        PERROR("write: p2m_frame_list");
-        goto out;
-    }
-
-    success = 1;
-
- out:
-    
-    if ( !success && p2m )
-        munmap(p2m, ROUNDUP(p2m_size * sizeof(xen_pfn_t), PAGE_SHIFT));
-
-    if ( live_p2m_frame_list_list )
-        munmap(live_p2m_frame_list_list, PAGE_SIZE);
-
-    if ( live_p2m_frame_list )
-        munmap(live_p2m_frame_list, P2M_FLL_ENTRIES * PAGE_SIZE);
-
-    if ( p2m_frame_list_list ) 
-        free(p2m_frame_list_list);
-
-    if ( p2m_frame_list ) 
-        free(p2m_frame_list);
-
-    return success ? p2m : NULL;
-}
-
-
-
 int xc_domain_save(int xc_handle, int io_fd, uint32_t dom, uint32_t max_iters,
                    uint32_t max_factor, uint32_t flags, int (*suspend)(int),
+                   int (*restart)(int), 
                    int hvm, void *(*init_qemu_maps)(int, unsigned), 
                    void (*qemu_flip_buffer)(int, int))
 {
-    xc_dominfo_t info;
-    DECLARE_DOMCTL;
-
-    int rc = 1, frc, i, j, last_iter, iter = 0;
-    int live  = (flags & XCFLAGS_LIVE);
-    int debug = (flags & XCFLAGS_DEBUG);
-    int race = 0, sent_last_iter, skip_this_iter;
-
-    /* The new domain's shared-info frame number. */
-    unsigned long shared_info_frame;
-
-    /* A copy of the CPU context of the guest. */
-    vcpu_guest_context_either_t ctxt;
-
-    /* A table containing the type of each PFN (/not/ MFN!). */
+    int rc = 1, i, j;
+    unsigned int fn, bcounter;
+    
+    /* Array of pfn + type for a batch */
     unsigned long *pfn_type = NULL;
-    unsigned long *pfn_batch = NULL;
 
     /* A copy of one frame of guest memory. */
     char page[PAGE_SIZE];
 
-    /* Live mapping of shared info structure */
-    shared_info_either_t *live_shinfo = NULL;
+    /* CoW buffers. */
+    unsigned long *cow_pfn_types = NULL;
+    char *cow_pages = NULL;
+    unsigned long cow_count = 0;
+    unsigned long cow_buffers_size = 0;
 
-    /* base of the region in which domain memory is mapped */
+    /* Base of the region in which domain memory is mapped */
     unsigned char *region_base = NULL;
-
-    /* bitmap of pages:
-       - that should be sent this iteration (unless later marked as skip);
-       - to skip this iteration because already dirty;
-       - to fixup by sending at the end if not already resent; */
-    unsigned long *to_send = NULL, *to_skip = NULL, *to_fix = NULL;
-
-    xc_shadow_op_stats_t stats;
-
-    unsigned long needed_to_fix = 0;
-    unsigned long total_sent    = 0;
-
-    uint64_t vcpumap = 1ULL;
 
     /* HVM: a buffer for holding HVM context */
     uint32_t hvm_buf_size = 0;
     uint8_t *hvm_buf = NULL;
+    uint32_t rec_size; 
 
     /* HVM: magic frames for ioreqs and xenstore comms. */
     uint64_t magic_pfns[3]; /* ioreq_pfn, bufioreq_pfn, store_pfn */
 
-    unsigned long mfn;
+    /* VCPU info */
+    uint64_t vcpumap = 1ULL;
+    xc_dominfo_t info;
+    struct {
+            int minustwo;
+            int max_vcpu_id;
+            uint64_t vcpumap;
+    } chunk;
 
-    /* If no explicit control parameters given, use defaults */
-    max_iters  = max_iters  ? : DEF_MAX_ITERS;
-    max_factor = max_factor ? : DEF_MAX_FACTOR;
+    unsigned long *cow_bitmap = NULL;
 
-    initialize_mbit_rate();
+    unsigned int hfn;
+    unsigned long *hot_bitmap = NULL;
 
-    if ( !get_platform_info(xc_handle, dom,
-                            &max_mfn, &hvirt_start, &pt_levels, &guest_width) )
+
+    /* 
+     * Get platform and runtime information
+     */
+    if (!get_platform_info(xc_handle, dom,
+                           &max_mfn, &hvirt_start, &pt_levels, &guest_width))
     {
         ERROR("Unable to get platform info.");
         return 1;
     }
 
-    if ( xc_domain_getinfo(xc_handle, dom, 1, &info) != 1 )
+    if (xc_domain_getinfo(xc_handle, dom, 1, &info) != 1)
     {
         ERROR("Could not get domain info");
         return 1;
     }
+    chunk.minustwo = -2;
+    chunk.max_vcpu_id = info.max_vcpu_id;
 
-    shared_info_frame = info.shared_info_frame;
-
-    /* Map the shared info frame */
-    if ( !hvm )
-    {
-        live_shinfo = xc_map_foreign_range(xc_handle, dom, PAGE_SIZE,
-                                           PROT_READ, shared_info_frame);
-        if ( !live_shinfo )
-        {
-            ERROR("Couldn't map live_shinfo");
-            goto out;
-        }
-    }
-
-    /* Get the size of the P2M table */
     p2m_size = xc_memory_op(xc_handle, XENMEM_maximum_gpfn, &dom) + 1;
+    cow_buffers_size = 
+         xc_memory_op(xc_handle, XENMEM_maximum_reservation, &dom) + 1;
 
-    /* Domain is still running at this point */
-    if ( live )
+    
+    /*
+     * Allocate buffers for holding checkpoint state
+     */
+
+    /* buffer for HVM context */
+    hvm_buf_size = xc_domain_hvm_getcontext(xc_handle, dom, 0, 0);
+    if ( hvm_buf_size == -1 )
     {
-        /* Live suspend. Enable log-dirty mode. */
-        if ( xc_shadow_control(xc_handle, dom,
-                               XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
-                               NULL, 0, NULL, 0, NULL) < 0 )
-        {
-            /* log-dirty already enabled? There's no test op,
-               so attempt to disable then reenable it */
-            frc = xc_shadow_control(xc_handle, dom, XEN_DOMCTL_SHADOW_OP_OFF,
-                                    NULL, 0, NULL, 0, NULL);
-            if ( frc >= 0 )
-            {
-                frc = xc_shadow_control(xc_handle, dom,
-                                        XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
-                                        NULL, 0, NULL, 0, NULL);
-            }
-            
-            if ( frc < 0 )
-            {
-                ERROR("Couldn't enable shadow mode (rc %d) (errno %d)", frc, errno );
-                goto out;
-            }
-        }
-
-        if ( hvm )
-        {
-            /* Get qemu-dm logging dirty pages too */
-            void *seg = init_qemu_maps(dom, BITMAP_SIZE);
-            qemu_bitmaps[0] = seg;
-            qemu_bitmaps[1] = seg + BITMAP_SIZE;
-            qemu_active = 0;
-            qemu_non_active = 1;
-        }
+        ERROR("Couldn't get HVM context size from Xen");
+        goto out;
     }
-    else
+    hvm_buf = malloc(hvm_buf_size);
+    if ( !hvm_buf )
     {
-        /* This is a non-live suspend. Suspend the domain .*/
-        if ( suspend_and_state(suspend, xc_handle, io_fd, dom, &info) )
-        {
-            ERROR("Domain appears not to have suspended");
-            goto out;
-        }
-    }
-
-    last_iter = !live;
-
-    /* pretend we sent all the pages last iteration */
-    sent_last_iter = p2m_size;
-
-    /* Setup to_send / to_fix and to_skip bitmaps */
-    to_send = xg_memalign(PAGE_SIZE, ROUNDUP(BITMAP_SIZE, PAGE_SHIFT)); 
-    to_fix  = calloc(1, BITMAP_SIZE);
-    to_skip = xg_memalign(PAGE_SIZE, ROUNDUP(BITMAP_SIZE, PAGE_SHIFT)); 
-
-    if ( !to_send || !to_fix || !to_skip )
-    {
-        ERROR("Couldn't allocate to_send array");
+        ERROR("Couldn't allocate memory");
         goto out;
     }
 
-    memset(to_send, 0xff, BITMAP_SIZE);
-
-    if ( lock_pages(to_send, BITMAP_SIZE) )
+    /* CoW buffers */
+    cow_pages = xg_memalign(PAGE_SIZE, PAGE_SIZE * cow_buffers_size); 
+    if (cow_pages == NULL)
     {
-        ERROR("Unable to lock to_send");
-        return 1;
+        ERROR("Failed to alloc memory for cow_pages");
+        goto out;
+    }
+    memset(cow_pages, 0, PAGE_SIZE * cow_buffers_size);
+    if (lock_pages(cow_pages, PAGE_SIZE * cow_buffers_size))
+    {
+        ERROR("Unable to lock/pin cow_pages");
+        goto out;
     }
 
-    /* (to fix is local only) */
-    if ( lock_pages(to_skip, BITMAP_SIZE) )
+    cow_pfn_types = xg_memalign(PAGE_SIZE,
+                                ROUNDUP(sizeof(unsigned long) * 
+                                        cow_buffers_size, PAGE_SHIFT));
+    if (cow_pfn_types == NULL)
     {
-        ERROR("Unable to lock to_skip");
-        return 1;
+        ERROR("Failed to alloc memory for cow_pfn_types");
+        goto out;
+    }
+    memset(cow_pfn_types, 0, ROUNDUP(sizeof(unsigned long) *
+                                     cow_buffers_size, PAGE_SHIFT));
+    if (lock_pages(cow_pfn_types, sizeof(unsigned long) * 
+                                  cow_buffers_size))
+    {
+        ERROR("Unable to lock/pin cow_pfn_types");
+        goto out;
     }
 
-    if ( hvm ) 
+    /* Batch pfn_type array */
+    pfn_type = xg_memalign(PAGE_SIZE,
+        ROUNDUP(MAX_BATCH_SIZE * sizeof(*pfn_type), PAGE_SHIFT));
+    if (pfn_type == NULL)
     {
-        /* Need another buffer for HVM context */
-        hvm_buf_size = xc_domain_hvm_getcontext(xc_handle, dom, 0, 0);
-        if ( hvm_buf_size == -1 )
-        {
-            ERROR("Couldn't get HVM context size from Xen");
-            goto out;
-        }
-        hvm_buf = malloc(hvm_buf_size);
-        if ( !hvm_buf )
-        {
-            ERROR("Couldn't allocate memory");
-            goto out;
-        }
-    }
-
-    analysis_phase(xc_handle, dom, p2m_size, to_skip, 0);
-
-    pfn_type   = xg_memalign(PAGE_SIZE, ROUNDUP(
-                              MAX_BATCH_SIZE * sizeof(*pfn_type), PAGE_SHIFT));
-    pfn_batch  = calloc(MAX_BATCH_SIZE, sizeof(*pfn_batch));
-    if ( (pfn_type == NULL) || (pfn_batch == NULL) )
-    {
-        ERROR("failed to alloc memory for pfn_type and/or pfn_batch arrays");
+        ERROR("failed to alloc memory for pfn_type array");
         errno = ENOMEM;
         goto out;
     }
     memset(pfn_type, 0,
            ROUNDUP(MAX_BATCH_SIZE * sizeof(*pfn_type), PAGE_SHIFT));
-
-    if ( lock_pages(pfn_type, MAX_BATCH_SIZE * sizeof(*pfn_type)) )
+    if (lock_pages(pfn_type, MAX_BATCH_SIZE * sizeof(*pfn_type)))
     {
         ERROR("Unable to lock pfn_type array");
         goto out;
     }
 
-    /* Setup the mfn_to_pfn table mapping */
-    if ( !(live_m2p = xc_map_m2p(xc_handle, max_mfn, PROT_READ)) )
+    /* hot bitmap */
+    hot_bitmap = xg_memalign(PAGE_SIZE, ROUNDUP(BITMAP_SIZE, PAGE_SHIFT));
+    memset(hot_bitmap, 0, BITMAP_SIZE);
+    if (lock_pages(hot_bitmap, BITMAP_SIZE))
     {
-        ERROR("Failed to map live M2P table");
+        ERROR("Unable to lock hot_bitmap");
         goto out;
     }
 
-    /* Start writing out the saved-domain record. */
-    if ( write_exact(io_fd, &p2m_size, sizeof(unsigned long)) )
+    /* cow bitmap */
+    cow_bitmap = xg_memalign(PAGE_SIZE, ROUNDUP(BITMAP_SIZE, PAGE_SHIFT));
+    memset(cow_bitmap, 0, BITMAP_SIZE);
+    if (lock_pages(cow_bitmap, BITMAP_SIZE))
     {
-        PERROR("write: p2m_size");
+        ERROR("Unable to lock cow_bitmap");
         goto out;
     }
 
-    if ( !hvm )
+
+    /*
+     * Start writing saved-domain record
+     */
+    if (write_exact(io_fd, &p2m_size, sizeof(unsigned long)))
     {
-        int err = 0;
-
-        /* Map the P2M table, and write the list of P2M frames */
-        live_p2m = map_and_save_p2m_table(xc_handle, io_fd, dom, 
-                                          p2m_size, live_shinfo);
-        if ( live_p2m == NULL )
-        {
-            ERROR("Failed to map/save the p2m frame list");
-            goto out;
-        }
-
-        /*
-         * Quick belt and braces sanity check.
-         */
-        
-        for ( i = 0; i < p2m_size; i++ )
-        {
-            mfn = pfn_to_mfn(i);
-            if( (mfn != INVALID_P2M_ENTRY) && (mfn_to_pfn(mfn) != i) )
-            {
-                DPRINTF("i=0x%x mfn=%lx live_m2p=%lx\n", i,
-                        mfn, mfn_to_pfn(mfn));
-                err++;
-            }
-        }
-        DPRINTF("Had %d unexplained entries in p2m table\n", err);
+        ERROR("write: p2m_size");
+        goto out;
     }
 
-    print_stats(xc_handle, dom, 0, &stats, 0);
 
-    /* Now write out each data page, canonicalising page tables as we go... */
-    for ( ; ; )
+    /*
+     * Suspend domain
+     */
+    DPRINTF("suspend_and_state() begin\n");
+    if (suspend_and_state(suspend, xc_handle, io_fd, dom, &info))
     {
-        unsigned int prev_pc, sent_this_iter, N, batch;
+        ERROR("Domain appears not to have suspended");
+        goto out;
+    }
 
-        iter++;
-        sent_this_iter = 0;
-        skip_this_iter = 0;
-        prev_pc = 0;
-        N = 0;
 
-        DPRINTF("Saving memory pages: iter %d   0%%", iter);
+    /* 
+     * Copy critical state before restarting domain 
+     */
 
-        while ( N < p2m_size )
-        {
-            unsigned int this_pc = (N * 100) / p2m_size;
-
-            if ( (this_pc - prev_pc) >= 5 )
-            {
-                DPRINTF("\b\b\b\b%3d%%", this_pc);
-                prev_pc = this_pc;
-            }
-
-            if ( !last_iter )
-            {
-                /* Slightly wasteful to peek the whole array evey time,
-                   but this is fast enough for the moment. */
-                frc = xc_shadow_control(
-                    xc_handle, dom, XEN_DOMCTL_SHADOW_OP_PEEK, to_skip, 
-                    p2m_size, NULL, 0, NULL);
-                if ( frc != p2m_size )
-                {
-                    ERROR("Error peeking shadow bitmap");
-                    goto out;
-                }
-            }
-
-            /* load pfn_type[] with the mfn of all the pages we're doing in
-               this batch. */
-            for  ( batch = 0;
-                   (batch < MAX_BATCH_SIZE) && (N < p2m_size);
-                   N++ )
-            {
-                int n = N;
-
-                if ( debug )
-                {
-                    DPRINTF("%d pfn= %08lx mfn= %08lx %d",
-                            iter, (unsigned long)n,
-                            hvm ? 0 : pfn_to_mfn(n),
-                            test_bit(n, to_send));
-                    if ( !hvm && is_mapped(pfn_to_mfn(n)) )
-                        DPRINTF("  [mfn]= %08lx",
-                                mfn_to_pfn(pfn_to_mfn(n)&0xFFFFF));
-                    DPRINTF("\n");
-                }
-                if ( !last_iter &&
-                     test_bit(n, to_send) &&
-                     test_bit(n, to_skip) )
-                    skip_this_iter++; /* stats keeping */
-
-                if ( !((test_bit(n, to_send) && !test_bit(n, to_skip)) ||
-                       (test_bit(n, to_send) && last_iter) ||
-                       (test_bit(n, to_fix)  && last_iter)) )
-                    continue;
-
-                /* Skip PFNs that aren't really there */
-                if ( hvm && ((n >= 0xa0 && n < 0xc0) /* VGA hole */
-                             || (n >= (HVM_BELOW_4G_MMIO_START >> PAGE_SHIFT) 
-                                 && n < (1ULL<<32) >> PAGE_SHIFT)) /* MMIO */ )
-                    continue;
-
-                /*
-                ** we get here if:
-                **  1. page is marked to_send & hasn't already been re-dirtied
-                **  2. (ignore to_skip in last iteration)
-                **  3. add in pages that still need fixup (net bufs)
-                */
-
-                pfn_batch[batch] = n;
-
-                /* Hypercall interfaces operate in PFNs for HVM guests
-                * and MFNs for PV guests */
-                if ( hvm ) 
-                    pfn_type[batch] = n;
-                else
-                    pfn_type[batch] = pfn_to_mfn(n);
-                    
-                if ( !is_mapped(pfn_type[batch]) )
-                {
-                    /*
-                    ** not currently in psuedo-physical map -- set bit
-                    ** in to_fix since we must send this page in last_iter
-                    ** unless its sent sooner anyhow, or it never enters
-                    ** pseudo-physical map (e.g. for ballooned down doms)
-                    */
-                    set_bit(n, to_fix);
-                    continue;
-                }
-
-                if ( last_iter &&
-                     test_bit(n, to_fix) &&
-                     !test_bit(n, to_send) )
-                {
-                    needed_to_fix++;
-                    DPRINTF("Fix! iter %d, pfn %x. mfn %lx\n",
-                            iter, n, pfn_type[batch]);
-                }
-                
-                clear_bit(n, to_fix);
-                
-                batch++;
-            }
-
-            if ( batch == 0 )
-                goto skip; /* vanishingly unlikely... */
-
-            region_base = xc_map_foreign_batch(
-                xc_handle, dom, PROT_READ, pfn_type, batch);
-            if ( region_base == NULL )
-            {
-                ERROR("map batch failed");
-                goto out;
-            }
-
-            if ( !hvm )
-            {
-                /* Get page types */
-                for ( j = 0; j < batch; j++ )
-                    ((uint32_t *)pfn_type)[j] = pfn_type[j];
-                if ( xc_get_pfn_type_batch(xc_handle, dom, batch,
-                                           (uint32_t *)pfn_type) )
-                {
-                    ERROR("get_pfn_type_batch failed");
-                    goto out;
-                }
-                for ( j = batch-1; j >= 0; j-- )
-                    pfn_type[j] = ((uint32_t *)pfn_type)[j];
-
-                for ( j = 0; j < batch; j++ )
-                {
-                    
-                    if ( (pfn_type[j] & XEN_DOMCTL_PFINFO_LTAB_MASK) ==
-                         XEN_DOMCTL_PFINFO_XTAB )
-                    {
-                        DPRINTF("type fail: page %i mfn %08lx\n", 
-                                j, pfn_type[j]);
-                        continue;
-                    }
-                    
-                    if ( debug )
-                        DPRINTF("%d pfn= %08lx mfn= %08lx [mfn]= %08lx"
-                                " sum= %08lx\n",
-                                iter,
-                                (pfn_type[j] & XEN_DOMCTL_PFINFO_LTAB_MASK) |
-                                pfn_batch[j],
-                                pfn_type[j],
-                                mfn_to_pfn(pfn_type[j] &
-                                           ~XEN_DOMCTL_PFINFO_LTAB_MASK),
-                                csum_page(region_base + (PAGE_SIZE*j)));
-                    
-                    /* canonicalise mfn->pfn */
-                    pfn_type[j] = (pfn_type[j] & XEN_DOMCTL_PFINFO_LTAB_MASK) |
-                        pfn_batch[j];
-                }
-            }
-
-            if ( write_exact(io_fd, &batch, sizeof(unsigned int)) )
-            {
-                PERROR("Error when writing to state file (2)");
-                goto out;
-            }
-
-            if ( write_exact(io_fd, pfn_type, sizeof(unsigned long)*batch) )
-            {
-                PERROR("Error when writing to state file (3)");
-                goto out;
-            }
-
-            /* entering this loop, pfn_type is now in pfns (Not mfns) */
-            for ( j = 0; j < batch; j++ )
-            {
-                unsigned long pfn, pagetype;
-                void *spage = (char *)region_base + (PAGE_SIZE*j);
-
-                pfn      = pfn_type[j] & ~XEN_DOMCTL_PFINFO_LTAB_MASK;
-                pagetype = pfn_type[j] &  XEN_DOMCTL_PFINFO_LTAB_MASK;
-
-                /* write out pages in batch */
-                if ( pagetype == XEN_DOMCTL_PFINFO_XTAB )
-                    continue;
-
-                pagetype &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
-
-                if ( (pagetype >= XEN_DOMCTL_PFINFO_L1TAB) &&
-                     (pagetype <= XEN_DOMCTL_PFINFO_L4TAB) )
-                {
-                    /* We have a pagetable page: need to rewrite it. */
-                    race = 
-                        canonicalize_pagetable(pagetype, pfn, spage, page); 
-
-                    if ( race && !live )
-                    {
-                        ERROR("Fatal PT race (pfn %lx, type %08lx)", pfn,
-                              pagetype);
-                        goto out;
-                    }
-
-                    if ( ratewrite(io_fd, live, page, PAGE_SIZE) != PAGE_SIZE )
-                    {
-                        ERROR("Error when writing to state file (4)"
-                              " (errno %d)", errno);
-                        goto out;
-                    }
-                }
-                else
-                {
-                    /* We have a normal page: just write it directly. */
-                    if ( ratewrite(io_fd, live, spage, PAGE_SIZE) !=
-                         PAGE_SIZE )
-                    {
-                        ERROR("Error when writing to state file (5)"
-                              " (errno %d)", errno);
-                        goto out;
-                    }
-                }
-            } /* end of the write out for this batch */
-
-            sent_this_iter += batch;
-
-            munmap(region_base, batch*PAGE_SIZE);
-
-        } /* end of this while loop for this iteration */
-
-      skip:
-
-        total_sent += sent_this_iter;
-
-        DPRINTF("\r %d: sent %d, skipped %d, ",
-                iter, sent_this_iter, skip_this_iter );
-
-        if ( last_iter )
-        {
-            print_stats( xc_handle, dom, sent_this_iter, &stats, 1);
-
-            DPRINTF("Total pages sent= %ld (%.2fx)\n",
-                    total_sent, ((float)total_sent)/p2m_size );
-            DPRINTF("(of which %ld were fixups)\n", needed_to_fix  );
-        }
-
-        if ( last_iter && debug )
-        {
-            int minusone = -1;
-            memset(to_send, 0xff, BITMAP_SIZE);
-            debug = 0;
-            DPRINTF("Entering debug resend-all mode\n");
-
-            /* send "-1" to put receiver into debug mode */
-            if ( write_exact(io_fd, &minusone, sizeof(int)) )
-            {
-                PERROR("Error when writing to state file (6)");
-                goto out;
-            }
-
-            continue;
-        }
-
-        if ( last_iter )
-            break;
-
-        if ( live )
-        {
-            if ( ((sent_this_iter > sent_last_iter) && RATE_IS_MAX()) ||
-                 (iter >= max_iters) ||
-                 (sent_this_iter+skip_this_iter < 50) ||
-                 (total_sent > p2m_size*max_factor) )
-            {
-                DPRINTF("Start last iteration\n");
-                last_iter = 1;
-
-                if ( suspend_and_state(suspend, xc_handle, io_fd, dom, &info) )
-                {
-                    ERROR("Domain appears not to have suspended");
-                    goto out;
-                }
-
-                DPRINTF("SUSPEND shinfo %08lx\n", info.shared_info_frame);
-            }
-
-            if ( xc_shadow_control(xc_handle, dom, 
-                                   XEN_DOMCTL_SHADOW_OP_CLEAN, to_send, 
-                                   p2m_size, NULL, 0, &stats) != p2m_size )
-            {
-                ERROR("Error flushing shadow PT");
-                goto out;
-            }
-
-            if ( hvm ) 
-            {
-                /* Pull in the dirty bits from qemu-dm too */
-                if ( !last_iter )
-                {
-                    qemu_active = qemu_non_active;
-                    qemu_non_active = qemu_active ? 0 : 1;
-                    qemu_flip_buffer(dom, qemu_active);
-                    for ( j = 0; j < BITMAP_SIZE / sizeof(unsigned long); j++ )
-                    {
-                        to_send[j] |= qemu_bitmaps[qemu_non_active][j];
-                        qemu_bitmaps[qemu_non_active][j] = 0;
-                    }
-                }
-                else
-                {
-                    for ( j = 0; j < BITMAP_SIZE / sizeof(unsigned long); j++ )
-                        to_send[j] |= qemu_bitmaps[qemu_active][j];
-                }
-            }
-
-            sent_last_iter = sent_this_iter;
-
-            print_stats(xc_handle, dom, sent_this_iter, &stats, 1);
-
-        }
-    } /* end of infinite for loop */
-
-    DPRINTF("All memory is saved\n");
-
+    /* VCPU data */
+    if ( info.max_vcpu_id >= 64 )
     {
-        struct {
-            int minustwo;
-            int max_vcpu_id;
-            uint64_t vcpumap;
-        } chunk = { -2, info.max_vcpu_id };
+        ERROR("Too many VCPUS in guest!");
+        goto out;
+    }
 
-        if ( info.max_vcpu_id >= 64 )
+    for (i = 1; i <= info.max_vcpu_id; i++)
+    {
+        xc_vcpuinfo_t vinfo;
+        if ((xc_vcpu_getinfo(xc_handle, dom, i, &vinfo) == 0) && vinfo.online)
+            vcpumap |= 1ULL << i;
+    }
+    chunk.vcpumap = vcpumap;
+
+    /* magic-page locations */
+    memset(magic_pfns, 0, sizeof(magic_pfns));
+    xc_get_hvm_param(xc_handle, dom, HVM_PARAM_IOREQ_PFN, 
+                     (unsigned long *)&magic_pfns[0]);
+    xc_get_hvm_param(xc_handle, dom, HVM_PARAM_BUFIOREQ_PFN,
+                     (unsigned long *)&magic_pfns[1]);
+    xc_get_hvm_param(xc_handle, dom, HVM_PARAM_STORE_PFN,
+                     (unsigned long *)&magic_pfns[2]);
+
+    /* HVM context */
+    if ((rec_size = xc_domain_hvm_getcontext(xc_handle, dom, hvm_buf, 
+                                              hvm_buf_size)) == -1)
+    {
+        ERROR("HVM:Could not get hvm buffer");
+        goto out;
+    }
+
+
+    /*
+     * Turn on CoW + shadow-log-dirty-mode
+     */
+    DPRINTF("Turning on CoW mode\n");
+    if (xc_cow_shadow_control(xc_handle, dom,
+                              XEN_DOMCTL_SHADOW_COW_ON,
+                              (unsigned long *) hot_bitmap,
+                              (unsigned long *) cow_pages,
+                              (unsigned long *) cow_pfn_types,
+                              NULL,
+                              NULL,
+                              cow_buffers_size, 0, 0) < 0)
+    {
+        ERROR("Could not enable CoW mode");
+        goto out;
+    }
+    else 
+    {
+        /* Get qemu-dm to log-dirty  */
+        void *seg = init_qemu_maps(dom, BITMAP_SIZE);
+        qemu_bitmaps[0] = seg;
+        qemu_bitmaps[1] = seg + BITMAP_SIZE;
+        qemu_active = 0;
+        qemu_non_active = 1;
+    }
+
+
+    /*
+     * Restart domain
+     */
+    DPRINTF("Restarting domain...\n");
+    if (restart_and_state(restart, xc_handle, io_fd, dom, &info))
+    {
+        ERROR("Domain appears not to have restarted");
+        goto out;
+    }
+
+
+    /*
+     * Copy memory pages of running VM
+     */
+    /* Can also just copy those pages not already dirtied with peek op */
+    for (fn = 0, hfn = 0; fn < p2m_size;)
+    {
+        bcounter = 0;
+
+        /* go through hot pages first */
+        for (; (bcounter < MAX_BATCH_SIZE) && (hfn < p2m_size); hfn++)
         {
-            ERROR("Too many VCPUS in guest!");
+            if (((hfn >= 0xa0 && hfn < 0xc0) /* VGA hole */
+                 || (hfn >= (HVM_BELOW_4G_MMIO_START >> PAGE_SHIFT)
+                        && hfn < (1ULL<<32) >> PAGE_SHIFT)) /* MMIO */)
+                continue;
+
+            if (test_bit(hfn, hot_bitmap) && 
+                !test_bit(hfn, cow_bitmap) &&
+                !test_bit(hfn, qemu_bitmaps[qemu_active]))
+            {
+                pfn_type[bcounter] = hfn;
+                bcounter++;
+            }
+        }
+        if (bcounter == MAX_BATCH_SIZE)
+            ERROR("more hot pages than a batch");
+
+        /* go through sequentially pfn address space */
+        for (; (bcounter < MAX_BATCH_SIZE) && (fn < p2m_size); fn++)
+        {
+            /* Skip PFNs that aren't really there */
+            if (((fn >= 0xa0 && fn < 0xc0) /* VGA hole */
+                 || (fn >= (HVM_BELOW_4G_MMIO_START >> PAGE_SHIFT) 
+                        && fn < (1ULL<<32) >> PAGE_SHIFT)) /* MMIO */)
+                continue;
+
+            /* Skip PFNs we have already copied */
+            if (!test_bit(fn, hot_bitmap) && 
+                !test_bit(fn, cow_bitmap) &&
+                !test_bit(hfn, qemu_bitmaps[qemu_active]))
+            {
+                pfn_type[bcounter] = fn;
+                bcounter++;
+            }
+        }
+
+        /* nothing to copy, empty batch */
+        if (bcounter == 0)
+        {
+            DPRINTF("bcounter == 0\n");
+            goto copy_done;
+        }
+
+        /* Map batch of pages through hypervisor call */
+        region_base = xc_map_foreign_batch(xc_handle, dom, PROT_READ,
+                                           pfn_type, bcounter);
+        if (region_base == NULL)
+        {
+            ERROR("Mapping of page failed");
             goto out;
         }
 
-        for ( i = 1; i <= info.max_vcpu_id; i++ )
+        /* Write pfn_type array out to saved_domain record */
+        if (write_exact(io_fd, &bcounter, sizeof(unsigned int)))
         {
-            xc_vcpuinfo_t vinfo;
-            if ( (xc_vcpu_getinfo(xc_handle, dom, i, &vinfo) == 0) &&
-                 vinfo.online )
-                vcpumap |= 1ULL << i;
-        }
-
-        chunk.vcpumap = vcpumap;
-        if ( write_exact(io_fd, &chunk, sizeof(chunk)) )
-        {
-            PERROR("Error when writing to state file");
+            ERROR("Error when writing to state file (2)");
             goto out;
         }
+        if (write_exact(io_fd, pfn_type, sizeof(unsigned long) * bcounter))
+        {
+            ERROR("Error when writing to state file (3)");
+            goto out;
+        }
+
+        /* Write batch of pages out to checkpoint */
+        for (j = 0; j < bcounter; j++)
+        {
+            unsigned long pfn, pagetype;
+            void *spage = (char *) region_base + (PAGE_SIZE * j);
+
+            pfn = pfn_type[j] & ~XEN_DOMCTL_PFINFO_LTAB_MASK;
+            pagetype = pfn_type[j] & XEN_DOMCTL_PFINFO_LTAB_MASK;
+
+            if (pagetype == XEN_DOMCTL_PFINFO_XTAB)
+                continue;
+
+            pagetype &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
+            if ((pagetype >= XEN_DOMCTL_PFINFO_L1TAB) &&
+                (pagetype <= XEN_DOMCTL_PFINFO_L4TAB))
+            {
+                DPRINTF("pagetable page 1\n");
+                /* We have a pagetable page: need to rewrite it. */
+                if (canonicalize_pagetable(pagetype, pfn,
+                                           spage, page))
+                {
+                    ERROR("Fatal PT race (pfn %lx, type %lx)", pfn, pagetype);
+                    goto out;
+                }
+                if (noncached_write(io_fd, page, PAGE_SIZE) != PAGE_SIZE)
+                {
+                    ERROR("Error when writing to state file (4)"
+                          " (errno %d)", errno);
+                    goto out;
+                }
+            }
+            else
+            {
+                /* We have a normal page: just write it directly. */
+                if (noncached_write(io_fd, spage, PAGE_SIZE) != PAGE_SIZE)
+                {
+                    ERROR("Error when writing to state file (5)"
+                          " (errno %d)", errno);
+                    goto out;
+                }
+            }
+        }
+
+        /* Unmap batch of pages */
+        munmap(region_base, bcounter * PAGE_SIZE);
+
+        /* Mark batch of pages dirty, so they can be writable again */
+        if (xc_cow_shadow_control(xc_handle, 
+                                  dom,
+                                  XEN_DOMCTL_SHADOW_COW_MARK_DIRTY,
+                                  NULL,
+                                  NULL,
+                                  pfn_type, 
+                                  NULL,
+                                  cow_bitmap, 
+                                  bcounter, 0, 0) < 0)
+        {
+            ERROR("Could not mark batch of copied pages dirty/writable");
+            goto out;
+        }
+    }
+copy_done:
+
+
+    /*
+     * Turn off CoW/log-dirty
+     */
+    DPRINTF("Turning off CoW\n");
+    if (xc_cow_shadow_control(xc_handle, 
+                              dom, 
+                              XEN_DOMCTL_SHADOW_COW_OFF,
+                              NULL,
+                              NULL, 
+                              NULL, 
+                              &cow_count,
+                              NULL,
+                              0, 0, 0) < 0)
+    {
+        ERROR("Could not disable CoW mode");
+        goto out;
+    }
+
+    /*
+     * Inform QEMU that log-dirty mode off
+     * This can be improved via shared channel between hyp and ioemu
+     */
+    /* pseudo turn off qemu logdirty by making all dirty */
+
+
+    /*
+     * Write pages from CoW buffer to saved_record
+     */
+    DPRINTF("Writing CoW pages...\n");
+    for (i = 0; i < cow_count; i += bcounter)
+    {
+        bcounter = MAX_BATCH_SIZE;
+        if (bcounter + i > cow_count)
+            bcounter = cow_count - i;
+
+        if (write_exact(io_fd, &bcounter, sizeof(unsigned int)))
+        {
+            ERROR("Error when writing to state file (2)");
+            goto out;
+        }
+        if (write_exact(io_fd, &(cow_pfn_types[i]), 
+                        sizeof(unsigned long) * bcounter))
+        {
+            ERROR("Error when writing to state file (3)");
+            goto out;
+        }
+
+        for (j = i; j < i + bcounter; j++)
+        {
+            unsigned long pfn, pagetype;
+
+            pfn = cow_pfn_types[j] & ~XEN_DOMCTL_PFINFO_LTAB_MASK;
+            pagetype = cow_pfn_types[j] & XEN_DOMCTL_PFINFO_LTAB_MASK;
+
+            if (pagetype == XEN_DOMCTL_PFINFO_XTAB)
+                continue;
+
+            pagetype &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
+
+            if ((pagetype >= XEN_DOMCTL_PFINFO_L1TAB) &&
+                (pagetype <= XEN_DOMCTL_PFINFO_L4TAB))
+            {
+                DPRINTF("pagetable page 2\n");
+                /* We have a pagetable page: need to rewrite it. */
+                if (canonicalize_pagetable(pagetype, 
+                                           pfn, 
+                                           &cow_pages[PAGE_SIZE * j], 
+                                           page))
+                {
+                    ERROR("Fatal PT race (pfn %lx, type %lx)", pfn, pagetype);
+                    goto out;
+                }
+                if (noncached_write(io_fd, page, PAGE_SIZE) != PAGE_SIZE)
+                {
+                    ERROR("Error when writing to state file (4) "
+                          "(errno %d)", errno);
+                    goto out;
+                }
+            }
+            else
+            {
+                /* We have a normal page: just write it directly. */
+                if (noncached_write(io_fd, 
+                                    &cow_pages[PAGE_SIZE * j], 
+                                    PAGE_SIZE) != PAGE_SIZE)
+                {
+                    ERROR("Error when writing to state file (5)"
+                          " (errno %d)", errno);
+                    goto out;
+                }
+            }
+        }
+    }
+    
+    /* Write chunk */
+    DPRINTF("Writing chunk\n");
+    if (write_exact(io_fd, &chunk, sizeof(chunk)))
+    {
+        ERROR("Error when writing to state file (errno %d)", errno);
+        goto out;
     }
 
     /* Zero terminate */
     i = 0;
-    if ( write_exact(io_fd, &i, sizeof(int)) )
+    if (write_exact(io_fd, &i, sizeof(int)))
     {
-        PERROR("Error when writing to state file (6')");
+        ERROR("Error when writing to state file (6') (errno %d)", errno);
+        goto out;
+    }
+    
+    /* Save magic-page locations */
+    DPRINTF("Writing magic_pfns, rec_size, hvm_buf\n");
+    if (write_exact(io_fd, magic_pfns, sizeof(magic_pfns)))
+    {
+        ERROR("Error when writing to state file (7)");
         goto out;
     }
 
-    if ( hvm ) 
+    /* Save HVM context */
+    if (write_exact(io_fd, &rec_size, sizeof(uint32_t)))
     {
-        uint32_t rec_size;
-
-        /* Save magic-page locations. */
-        memset(magic_pfns, 0, sizeof(magic_pfns));
-        xc_get_hvm_param(xc_handle, dom, HVM_PARAM_IOREQ_PFN,
-                         (unsigned long *)&magic_pfns[0]);
-        xc_get_hvm_param(xc_handle, dom, HVM_PARAM_BUFIOREQ_PFN,
-                         (unsigned long *)&magic_pfns[1]);
-        xc_get_hvm_param(xc_handle, dom, HVM_PARAM_STORE_PFN,
-                         (unsigned long *)&magic_pfns[2]);
-        if ( write_exact(io_fd, magic_pfns, sizeof(magic_pfns)) )
-        {
-            PERROR("Error when writing to state file (7)");
-            goto out;
-        }
-
-        /* Get HVM context from Xen and save it too */
-        if ( (rec_size = xc_domain_hvm_getcontext(xc_handle, dom, hvm_buf, 
-                                                  hvm_buf_size)) == -1 )
-        {
-            ERROR("HVM:Could not get hvm buffer");
-            goto out;
-        }
-        
-        if ( write_exact(io_fd, &rec_size, sizeof(uint32_t)) )
-        {
-            PERROR("error write hvm buffer size");
-            goto out;
-        }
-        
-        if ( write_exact(io_fd, hvm_buf, rec_size) )
-        {
-            PERROR("write HVM info failed!\n");
-            goto out;
-        }
-        
-        /* HVM guests are done now */
-        rc = 0;
+        ERROR("error write hvm buffer size");
+        goto out;
+    }
+    if (write_exact(io_fd, hvm_buf, rec_size))
+    {
+        ERROR("write HVM info failed!\n");
         goto out;
     }
 
-    /* PV guests only from now on */
 
-    /* Send through a list of all the PFNs that were not in map at the close */
-    {
-        unsigned int i,j;
-        unsigned long pfntab[1024];
-
-        for ( i = 0, j = 0; i < p2m_size; i++ )
-        {
-            if ( !is_mapped(pfn_to_mfn(i)) )
-                j++;
-        }
-
-        if ( write_exact(io_fd, &j, sizeof(unsigned int)) )
-        {
-            PERROR("Error when writing to state file (6a)");
-            goto out;
-        }
-
-        for ( i = 0, j = 0; i < p2m_size; )
-        {
-            if ( !is_mapped(pfn_to_mfn(i)) )
-                pfntab[j++] = i;
-
-            i++;
-            if ( (j == 1024) || (i == p2m_size) )
-            {
-                if ( write_exact(io_fd, &pfntab, sizeof(unsigned long)*j) )
-                {
-                    PERROR("Error when writing to state file (6b)");
-                    goto out;
-                }
-                j = 0;
-            }
-        }
-    }
-
-    if ( xc_vcpu_getcontext(xc_handle, dom, 0, &ctxt.c) )
-    {
-        ERROR("Could not get vcpu context");
-        goto out;
-    }
-
-    /* Canonicalise the suspend-record frame number. */
-    mfn = GET_FIELD(&ctxt, user_regs.edx);
-    if ( !MFN_IS_IN_PSEUDOPHYS_MAP(mfn) )
-    {
-        ERROR("Suspend record is not in range of pseudophys map");
-        goto out;
-    }
-    SET_FIELD(&ctxt, user_regs.edx, mfn_to_pfn(mfn));
-
-    for ( i = 0; i <= info.max_vcpu_id; i++ )
-    {
-        if ( !(vcpumap & (1ULL << i)) )
-            continue;
-
-        if ( (i != 0) && xc_vcpu_getcontext(xc_handle, dom, i, &ctxt.c) )
-        {
-            ERROR("No context for VCPU%d", i);
-            goto out;
-        }
-
-        /* Canonicalise each GDT frame number. */
-        for ( j = 0; (512*j) < GET_FIELD(&ctxt, gdt_ents); j++ )
-        {
-            mfn = GET_FIELD(&ctxt, gdt_frames[j]);
-            if ( !MFN_IS_IN_PSEUDOPHYS_MAP(mfn) )
-            {
-                ERROR("GDT frame is not in range of pseudophys map");
-                goto out;
-            }
-            SET_FIELD(&ctxt, gdt_frames[j], mfn_to_pfn(mfn));
-        }
-
-        /* Canonicalise the page table base pointer. */
-        if ( !MFN_IS_IN_PSEUDOPHYS_MAP(UNFOLD_CR3(
-                                           GET_FIELD(&ctxt, ctrlreg[3]))) )
-        {
-            ERROR("PT base is not in range of pseudophys map");
-            goto out;
-        }
-        SET_FIELD(&ctxt, ctrlreg[3], 
-            FOLD_CR3(mfn_to_pfn(UNFOLD_CR3(GET_FIELD(&ctxt, ctrlreg[3])))));
-
-        /* Guest pagetable (x86/64) stored in otherwise-unused CR1. */
-        if ( (pt_levels == 4) && ctxt.x64.ctrlreg[1] )
-        {
-            if ( !MFN_IS_IN_PSEUDOPHYS_MAP(UNFOLD_CR3(ctxt.x64.ctrlreg[1])) )
-            {
-                ERROR("PT base is not in range of pseudophys map");
-                goto out;
-            }
-            /* Least-significant bit means 'valid PFN'. */
-            ctxt.x64.ctrlreg[1] = 1 |
-                FOLD_CR3(mfn_to_pfn(UNFOLD_CR3(ctxt.x64.ctrlreg[1])));
-        }
-
-        if ( write_exact(io_fd, &ctxt, ((guest_width==8) 
-                                        ? sizeof(ctxt.x64) 
-                                        : sizeof(ctxt.x32))) )
-        {
-            PERROR("Error when writing to state file (1)");
-            goto out;
-        }
-
-        domctl.cmd = XEN_DOMCTL_get_ext_vcpucontext;
-        domctl.domain = dom;
-        domctl.u.ext_vcpucontext.vcpu = i;
-        if ( xc_domctl(xc_handle, &domctl) < 0 )
-        {
-            ERROR("No extended context for VCPU%d", i);
-            goto out;
-        }
-        if ( write_exact(io_fd, &domctl.u.ext_vcpucontext, 128) )
-        {
-            PERROR("Error when writing to state file (2)");
-            goto out;
-        }
-    }
-
-    /*
-     * Reset the MFN to be a known-invalid value. See map_frame_list_list().
+    /* 
+     * Done and checkpoint successful 
      */
-    memcpy(page, live_shinfo, PAGE_SIZE);
-    SET_FIELD(((shared_info_either_t *)page), 
-              arch.pfn_to_mfn_frame_list_list, 0);
-    if ( write_exact(io_fd, page, PAGE_SIZE) )
-    {
-        PERROR("Error when writing to state file (1)");
-        goto out;
-    }
-
-    /* Success! */
+    DPRINTF("Checkpoint completed successfully.\n");
     rc = 0;
 
- out:
-
-    if ( live )
+out:
+    /* pseudo turn off qemu logdirty by making all dirty */
+    qemu_active = qemu_non_active;
+    qemu_non_active = qemu_active ? 0 : 1;
+    qemu_flip_buffer(dom, qemu_active);
+    for (j = 0; j < BITMAP_SIZE / sizeof(unsigned long); j++)
     {
-        if ( xc_shadow_control(xc_handle, dom, 
-                               XEN_DOMCTL_SHADOW_OP_OFF,
-                               NULL, 0, NULL, 0, NULL) < 0 )
-            DPRINTF("Warning - couldn't disable shadow mode");
+        qemu_bitmaps[qemu_active][j] = 0xffffffff;
+        qemu_bitmaps[qemu_non_active][j] = 0;
     }
 
     /* Flush last write and discard cache for file. */
     discard_file_cache(io_fd, 1 /* flush */);
 
-    if ( live_shinfo )
-        munmap(live_shinfo, PAGE_SIZE);
-
-    if ( live_p2m )
-        munmap(live_p2m, ROUNDUP(p2m_size * sizeof(xen_pfn_t), PAGE_SHIFT));
-
-    if ( live_m2p )
-        munmap(live_m2p, M2P_SIZE(max_mfn));
-
+    /* Free memory structures */
+    free(hvm_buf);
     free(pfn_type);
-    free(pfn_batch);
-    free(to_send);
-    free(to_fix);
-    free(to_skip);
+    free(cow_pages);
+    free(cow_pfn_types);
+    free(hot_bitmap);   
+    free(cow_bitmap);
 
     DPRINTF("Save exit rc=%d\n",rc);
-
     return !!rc;
 }
+
+
+
 
 /*
  * Local variables:

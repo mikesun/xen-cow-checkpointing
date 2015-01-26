@@ -50,6 +50,18 @@
 
 /*****************************************************************************
  * Entry points into the shadow code */
+void cow_copy(struct domain *d, mfn_t mfn, int from);
+void cow_update_shadows(struct vcpu *v, mfn_t gl2mfn);
+void cow_determine_hot(struct vcpu *v, mfn_t gl2mfn);
+#ifdef COW_INVERSE_MAP
+void cow_add_writeable_mappings(struct vcpu *v, mfn_t mfn);
+#endif
+
+static inline void cow_copy_page(struct domain *d, mfn_t mfn)
+{
+    if (unlikely(paging_mode_log_dirty(d)))
+        cow_copy(d, mfn, 1);
+}
 
 /* Set up the shadow-specific parts of a domain struct at start of day.
  * Called from paging_domain_init(). */

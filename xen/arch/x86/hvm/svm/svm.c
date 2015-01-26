@@ -25,7 +25,10 @@
 #include <xen/irq.h>
 #include <xen/softirq.h>
 #include <xen/hypercall.h>
+#include <xen/domain.h>
 #include <xen/domain_page.h>
+#include <xen/guest_access.h>
+#include <xen/event.h>
 #include <asm/current.h>
 #include <asm/io.h>
 #include <asm/paging.h>
@@ -47,6 +50,7 @@
 #include <asm/hvm/svm/intr.h>
 #include <asm/x86_emulate.h>
 #include <public/sched.h>
+#include <public/memory.h>
 #include <asm/hvm/vpt.h>
 #include <asm/hvm/trace.h>
 #include <asm/hap.h>
@@ -971,6 +975,8 @@ static void svm_do_nested_pgfault(paddr_t gpa, struct cpu_user_regs *regs)
     }
 
     /* Log-dirty: mark the page dirty and let the guest write it again */
+    /* Do CoW before write occurs */
+    cow_copy_page(current->domain, mfn);
     paging_mark_dirty(current->domain, mfn_x(mfn));
     p2m_change_type(current->domain, gfn, p2m_ram_logdirty, p2m_ram_rw);
 }

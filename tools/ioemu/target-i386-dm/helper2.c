@@ -674,6 +674,10 @@ int main_loop(void)
         }
 
         xenstore_record_dm_state("running");
+        
+        /* CoW: Get time that dm is restarted; use this to determine 
+           end of downtime */
+        
     }
 
     return 0;

@@ -37,6 +37,21 @@ static int suspend(int domid)
             !strncmp(ans, "done\n", 5));
 }
 
+/**
+ * Issue a restart request through stdout, and receive the acknowledgement
+ * from stdin.  This is handled by XendCheckpoint in the Python layer.
+ */
+static int restart(int r_domid)
+{
+    char ans[30];
+
+    printf("restart\n");
+    fflush(stdout);
+
+    return (fgets(ans, sizeof(ans), stdin) != NULL &&
+            !strncmp(ans, "done\n", 5));
+}
+
 /* For HVM guests, there are two sources of dirty pages: the Xen shadow
  * log-dirty bitmap, which we get with a hypercall, and qemu's version.
  * The protocol for getting page-dirtying data from qemu uses a
@@ -188,10 +203,9 @@ main(int argc, char **argv)
     flags = atoi(argv[5]);
 
     ret = xc_domain_save(xc_fd, io_fd, domid, maxit, max_f, flags, 
-                         &suspend, !!(flags & XCFLAGS_HVM),
+                         &suspend, &restart, !!(flags & XCFLAGS_HVM),
                          &init_qemu_maps, &qemu_flip_buffer);
 
     xc_interface_close(xc_fd);
-
     return ret;
 }

@@ -24,6 +24,39 @@ static QEMUTimer *insert_timer = NULL;
 #define UWAIT_MAX (30*1000000) /* thirty seconds */
 #define UWAIT     (100000)     /* 1/10th second  */
 
+#define PAGE_SHIFT              12
+#define PAGE_SIZE               (1UL << PAGE_SHIFT)
+#define PAGE_MASK               (~(PAGE_SIZE-1))
+#define ROUNDUP(_x,_w) (((unsigned long)(_x)+(1UL<<(_w))-1) & ~((1UL<<(_w))-1))
+
+int lock_pages(void *addr, size_t len)
+{
+      int e = 0;
+#ifndef __sun__
+      void *laddr = (void *)((unsigned long)addr & PAGE_MASK);
+      size_t llen = (len + ((unsigned long)addr - (unsigned long)laddr) +
+                     PAGE_SIZE - 1) & PAGE_MASK;
+      e = mlock(laddr, llen);
+#endif
+      return e;
+}
+
+static void *xg_memalign(size_t alignment, size_t size)
+{
+#if defined(_POSIX_C_SOURCE) && !defined(__sun__)
+    int ret;
+    void *ptr;
+    ret = posix_memalign(&ptr, alignment, size);
+    if (ret != 0)
+        return NULL;
+    return ptr;
+#elif defined(__NetBSD__) || defined(__OpenBSD__)
+    return valloc(size);
+#else
+    return memalign(alignment, size);
+#endif
+}
+
 static int pasprintf(char **buf, const char *fmt, ...)
 {
     va_list ap;
@@ -295,6 +328,7 @@ int xenstore_fd(void)
     return -1;
 }
 
+unsigned long *cow_bitmap = NULL;
 unsigned long *logdirty_bitmap = NULL;
 unsigned long logdirty_bitmap_size;
 extern int vga_ram_size, bios_size;
@@ -381,9 +415,21 @@ void xenstore_process_logdirty_event(void)
             fprintf(logfile, "Log-dirty: out of memory\n");
             exit(1);
         }
+        
+        /* cow bitmap */
+        cow_bitmap = xg_memalign(PAGE_SIZE, 
+                                 ROUNDUP(logdirty_bitmap_size, PAGE_SHIFT));
+        if (lock_pages(cow_bitmap, logdirty_bitmap_size))
+        {
+            fprintf(logfile, "Unable to lock cow_bitmap\n");
+            exit(1);
+        }
     }
 
     fprintf(logfile, "Triggered log-dirty buffer switch\n");
+    
+    /* clear cow_bitmap */
+    memset(cow_bitmap, 0, logdirty_bitmap_size);
     
     /* Read the required active buffer from the store */
     act = xs_read(xsh, XBT_NULL, next_active_path, &len);

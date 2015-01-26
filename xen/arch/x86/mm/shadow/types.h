@@ -139,6 +139,10 @@ static inline shadow_l1e_t
 shadow_l1e_remove_flags(shadow_l1e_t sl1e, u32 flags)
 { l1e_remove_flags(sl1e, flags); return sl1e; }
 
+static inline shadow_l1e_t
+shadow_l1e_add_flags(shadow_l1e_t sl1e, u32 flags)
+{ l1e_add_flags(sl1e, flags); return sl1e; }
+
 static inline shadow_l1e_t shadow_l1e_empty(void) 
 { return l1e_empty(); }
 static inline shadow_l2e_t shadow_l2e_empty(void) 

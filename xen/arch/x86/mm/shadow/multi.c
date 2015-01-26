@@ -28,6 +28,8 @@
 #include <xen/sched.h>
 #include <xen/perfc.h>
 #include <xen/domain_page.h>
+#include <xen/guest_access.h>
+#include <public/hvm/e820.h>
 #include <asm/page.h>
 #include <asm/current.h>
 #include <asm/shadow.h>
@@ -61,7 +63,7 @@
  * and if we do flush, re-do the walk.  If anything has changed, then 
  * pause all the other vcpus and do the walk *again*.
  *
- * PSE disabled / PSE36
+ * PSE disabled / PSE36/
  * We don't support any modes other than PSE enabled, PSE36 disabled.
  * Neither of those would be hard to change, but we'd need to be able to 
  * deal with shadows made in one mode and used in another.
@@ -83,6 +85,118 @@ static char *fetch_type_names[] = {
     [ft_demand_write] "demand write",
 };
 #endif
+
+/**************************************************************************
+ * Copy-on-Write (CoW) helper functions
+ */
+extern struct cow_data cow;
+
+void cow_copy(struct domain *d, mfn_t mfn, int from)
+{
+    void *b, *p;
+    unsigned long *cpt_ptr;    
+    struct page_info *page;
+    unsigned long pfn, pfn_type;
+    int do_locking;
+
+    if (!mfn_valid(mfn)) 
+        return;
+
+    do_locking = !shadow_locked_by_me(d);
+    if (do_locking)
+    {
+        shadow_lock(d);
+        /* Check the mode again with the lock held */
+        if (unlikely(!paging_mode_log_dirty(d)))
+        {
+            shadow_unlock(d);
+            return;
+        }
+    }
+    log_dirty_lock(d);
+
+    if (cow.counter > cow.pages_mfns_size)
+    {
+        printk("no more free cow pages to copy to\n");
+        goto out;
+    }
+
+    page = mfn_to_page(mfn);
+    if (get_page(page, d))
+    {
+        /* get pfn of page to copy */
+        pfn = mfn_to_gfn(d, mfn_x(mfn));
+        pfn_type = pfn;
+
+        /* Check if there is a valid M2P mapping */
+        if (!VALID_M2P(pfn))
+        {
+            put_page(page);
+            goto out;
+        }
+
+        if (((pfn >= 0xa0 && pfn < 0xc0) 
+                 || (pfn >= (HVM_BELOW_4G_MMIO_START >> PAGE_SHIFT)
+                            && pfn < (1ULL<<32) >> PAGE_SHIFT))) {
+            put_page(page);
+            goto out;
+        }
+
+        if (gmfn_to_mfn(d, pfn) != mfn)
+        {
+            put_page(page);
+            goto out;
+        }
+
+        if (sh_mfn_is_dirty(d, mfn))
+        {
+            put_page(page);
+            goto out;
+        }
+
+        switch(page->u.inuse.type_info & PGT_type_mask) 
+        {
+            case PGT_l1_page_table:
+                pfn_type |= XEN_DOMCTL_PFINFO_L1TAB;
+                break;
+            case PGT_l2_page_table:
+                pfn_type |= XEN_DOMCTL_PFINFO_L2TAB;
+                break;
+        }
+
+        if (page->u.inuse.type_info & PGT_pinned) 
+            pfn_type |= XEN_DOMCTL_PFINFO_LPINTAB;
+    }
+    else
+        goto out;
+
+    /* Map in dom0 allocated CoW pfn_type page */
+    b = map_domain_page(cow.cpt_mfns[COW_TYPE_FN(cow.counter)]);
+    cpt_ptr = &(((unsigned long *) b)[COW_TYPE_IX(cow.counter)]);
+    *cpt_ptr = pfn_type;
+    sh_unmap_domain_page(b);
+
+    /* Map in HVM guest page */
+    p = sh_map_domain_page(mfn);
+    b = map_domain_page(cow.pages_mfns[cow.counter]);
+    memcpy(b, p, PAGE_SIZE);
+    sh_unmap_domain_page(p);
+    sh_unmap_domain_page(b);
+
+    /* Update ref count */
+    put_page(page);
+
+    /* Update bookkeeping */
+    cow.counter++;
+    
+    /* Mark dirty */
+    _paging_mark_dirty(d, mfn, 0);
+
+out:
+    log_dirty_unlock(d);
+    if (do_locking)
+        shadow_unlock(d);
+}
 
 /**************************************************************************/
 /* Hash table mapping from guest pagetables to shadows
@@ -293,71 +407,10 @@ guest_walk_tables(struct vcpu *v, unsigned long va, walk_t *gw,
      * We will accumulate, in rc, the set of flags that are missing. */
     mflags = mandatory_flags(v, pfec);
 
-#if GUEST_PAGING_LEVELS >= 3 /* PAE or 64... */
-#if GUEST_PAGING_LEVELS >= 4 /* 64-bit only... */
-
-    /* Get the l4e from the top level table and check its flags*/
-    gw->l4mfn = pagetable_get_mfn(v->arch.guest_table);
-    l4p = ((guest_l4e_t *)v->arch.paging.shadow.guest_vtable);
-    gw->l4e = l4p[guest_l4_table_offset(va)];
-    gflags = guest_l4e_get_flags(gw->l4e) ^ _PAGE_NX_BIT;
-    rc |= ((gflags & mflags) ^ mflags);
-    if ( rc & _PAGE_PRESENT ) goto out;
-
-    /* Map the l3 table */
-    gw->l3mfn = gfn_to_mfn(d, guest_l4e_get_gfn(gw->l4e), &p2mt);
-    if ( !p2m_is_ram(p2mt) ) 
-    {
-        rc |= _PAGE_PRESENT;
-        goto out;
-    }
-    ASSERT(mfn_valid(gw->l3mfn));
-    /* This mfn is a pagetable: make sure the guest can't write to it. */
-    if ( shadow_op && sh_remove_write_access(v, gw->l3mfn, 3, va) != 0 )
-        flush_tlb_mask(d->domain_dirty_cpumask); 
-    /* Get the l3e and check its flags*/
-    l3p = sh_map_domain_page(gw->l3mfn);
-    gw->l3e = l3p[guest_l3_table_offset(va)];
-    gflags = guest_l3e_get_flags(gw->l3e) ^ _PAGE_NX_BIT;
-    rc |= ((gflags & mflags) ^ mflags);
-    if ( rc & _PAGE_PRESENT )
-        goto out;
-
-#else /* PAE only... */
-
-    /* Get l3e from the cache of the top level table and check its flag */
-    gw->l3e = v->arch.paging.shadow.gl3e[guest_l3_table_offset(va)];
-    if ( !(guest_l3e_get_flags(gw->l3e) & _PAGE_PRESENT) ) 
-    {
-        rc |= _PAGE_PRESENT;
-        goto out;
-    }
-
-#endif /* PAE or 64... */
-
-    /* Map the l2 table */
-    gw->l2mfn = gfn_to_mfn(d, guest_l3e_get_gfn(gw->l3e), &p2mt);
-    if ( !p2m_is_ram(p2mt) )
-    {
-        rc |= _PAGE_PRESENT;
-        goto out;
-    }
-    ASSERT(mfn_valid(gw->l2mfn));
-    /* This mfn is a pagetable: make sure the guest can't write to it. */
-    if ( shadow_op && sh_remove_write_access(v, gw->l2mfn, 2, va) != 0 )
-        flush_tlb_mask(d->domain_dirty_cpumask); 
-    /* Get the l2e */
-    l2p = sh_map_domain_page(gw->l2mfn);
-    gw->l2e = l2p[guest_l2_table_offset(va)];
-
-#else /* 32-bit only... */
-
     /* Get l2e from the top level table */
     gw->l2mfn = pagetable_get_mfn(v->arch.guest_table);
     l2p = ((guest_l2e_t *)v->arch.paging.shadow.guest_vtable);
     gw->l2e = l2p[guest_l2_table_offset(va)];
-
-#endif /* All levels... */
 
     gflags = guest_l2e_get_flags(gw->l2e) ^ _PAGE_NX_BIT;
     rc |= ((gflags & mflags) ^ mflags);
@@ -419,12 +472,10 @@ guest_walk_tables(struct vcpu *v, unsigned long va, walk_t *gw,
      * walkers behave this way. */
     if ( rc == 0 ) 
     {
-#if GUEST_PAGING_LEVELS == 4 /* 64-bit only... */
-        if ( set_ad_bits(l4p + guest_l4_table_offset(va), &gw->l4e, 0) )
-            paging_mark_dirty(d, mfn_x(gw->l4mfn));
-        if ( set_ad_bits(l3p + guest_l3_table_offset(va), &gw->l3e, 0) )
-            paging_mark_dirty(d, mfn_x(gw->l3mfn));
-#endif
+        /* CoW: Copy pages before they're dirtied */
+        cow_copy_page(d, mfn_x(gw->l2mfn));
+        cow_copy_page(d, mfn_x(gw->l1mfn));
+
         if ( set_ad_bits(l2p + guest_l2_table_offset(va), &gw->l2e,
                          (pse && (pfec & PFEC_write_access))) )
             paging_mark_dirty(d, mfn_x(gw->l2mfn));            
@@ -437,12 +488,6 @@ guest_walk_tables(struct vcpu *v, unsigned long va, walk_t *gw,
     }
 
  out:
-#if GUEST_PAGING_LEVELS == 4
-    if ( l3p ) sh_unmap_domain_page(l3p);
-#endif
-#if GUEST_PAGING_LEVELS >= 3
-    if ( l2p ) sh_unmap_domain_page(l2p);
-#endif
     if ( l1p ) sh_unmap_domain_page(l1p);
 
     return rc;
@@ -798,9 +843,12 @@ _sh_propagate(struct vcpu *v,
     if ( unlikely((level == 1) && shadow_mode_log_dirty(d)) )
     {
         if ( mfn_valid(target_mfn) ) {
-            if ( ft & FETCH_TYPE_WRITE ) 
+            if ( ft & FETCH_TYPE_WRITE ) {
+                /* CoW: make copy of page to buffer, then mark dirty */
+                cow_copy(d, target_mfn, 1);
                 paging_mark_dirty(d, mfn_x(target_mfn));
-            else if ( !sh_mfn_is_dirty(d, target_mfn) )
+            }
+            else if (!sh_mfn_is_dirty(d, target_mfn)) 
                 sflags &= ~_PAGE_RW;
         }
     }
@@ -976,7 +1024,7 @@ perms_strictly_increased(u32 old_flags, u32 new_flags)
 }
 
 static int inline
-shadow_get_page_from_l1e(shadow_l1e_t sl1e, struct domain *d)
+__shadow_get_page_from_l1e(shadow_l1e_t sl1e, struct domain *d, int cow_reset)
 {
     int res;
     mfn_t mfn;
@@ -987,7 +1035,7 @@ shadow_get_page_from_l1e(shadow_l1e_t sl1e, struct domain *d)
     if ( !shadow_mode_refcounts(d) )
         return 1;
 
-    res = get_page_from_l1e(sl1e, d);
+    res = __get_page_from_l1e(sl1e, d, cow_reset);
 
     // If a privileged domain is attempting to install a map of a page it does
     // not own, we let it succeed anyway.
@@ -1013,6 +1061,12 @@ shadow_get_page_from_l1e(shadow_l1e_t sl1e, struct domain *d)
     }
 
     return res;
+}
+
+static int inline
+shadow_get_page_from_l1e(shadow_l1e_t sl1e, struct domain *d)
+{
+    return __shadow_get_page_from_l1e(sl1e, d, 0);
 }
 
 static void inline
@@ -1186,10 +1240,11 @@ static int shadow_set_l2e(struct vcpu *v,
     return flags;
 }
 
-static int shadow_set_l1e(struct vcpu *v, 
-                          shadow_l1e_t *sl1e, 
-                          shadow_l1e_t new_sl1e,
-                          mfn_t sl1mfn)
+static inline int __shadow_set_l1e(struct vcpu *v, 
+                                shadow_l1e_t *sl1e, 
+                                shadow_l1e_t new_sl1e,
+                                mfn_t sl1mfn,
+                                int cow_reset)
 {
     int flags = 0;
     struct domain *d = v->domain;
@@ -1205,12 +1260,16 @@ static int shadow_set_l1e(struct vcpu *v,
     {
         /* About to install a new reference */        
         if ( shadow_mode_refcounts(d) ) {
-            if ( shadow_get_page_from_l1e(new_sl1e, d) == 0 ) 
+            if ( __shadow_get_page_from_l1e(new_sl1e, d, cow_reset) == 0 ) 
             {
                 /* Doesn't look like a pagetable. */
                 flags |= SHADOW_SET_ERROR;
                 new_sl1e = shadow_l1e_empty();
             }
+#ifdef COW_INVERSE_MAP
+            if (unlikely(paging_mode_log_dirty(d)))
+                invert_sh_table_insert(shadow_l1e_get_mfn(new_sl1e), sl1mfn);
+#endif
         }
     } 
 
@@ -1229,9 +1288,21 @@ static int shadow_set_l1e(struct vcpu *v,
         if ( shadow_mode_refcounts(d) ) 
         {
             shadow_put_page_from_l1e(old_sl1e, d);
+#ifdef COW_INVERSE_MAP
+            if (unlikely(paging_mode_log_dirty(d)))
+                invert_sh_table_remove(shadow_l1e_get_mfn(old_sl1e), sl1mfn);
+#endif
         } 
     }
     return flags;
+}
+
+static int shadow_set_l1e(struct vcpu *v, 
+                          shadow_l1e_t *sl1e, 
+                          shadow_l1e_t new_sl1e,
+                          mfn_t sl1mfn)
+{
+    return __shadow_set_l1e(v, sl1e, new_sl1e, sl1mfn, 0);
 }
 
 
@@ -2431,7 +2502,9 @@ static int validate_gl2e(struct vcpu *v, void *new_ge, mfn_t sl2mfn, void *se)
     return result;
 }
 
-static int validate_gl1e(struct vcpu *v, void *new_ge, mfn_t sl1mfn, void *se)
+static inline int 
+__validate_gl1e(struct vcpu *v, void *new_ge, mfn_t sl1mfn, 
+                void *se, int cow_reset)
 {
     shadow_l1e_t new_sl1e;
     guest_l1e_t new_gl1e = *(guest_l1e_t *)new_ge;
@@ -2448,10 +2521,14 @@ static int validate_gl1e(struct vcpu *v, void *new_ge, mfn_t sl1mfn, void *se)
 
     l1e_propagate_from_guest(v, new_gl1e, gmfn, &new_sl1e, ft_prefetch, p2mt);
     
-    result |= shadow_set_l1e(v, sl1p, new_sl1e, sl1mfn);
+    result |= __shadow_set_l1e(v, sl1p, new_sl1e, sl1mfn, cow_reset);
     return result;
 }
 
+static int validate_gl1e(struct vcpu *v, void *new_ge, mfn_t sl1mfn, void *se)
+{
+    return __validate_gl1e(v, new_ge, sl1mfn, se, 0);
+}
 
 /**************************************************************************/
 /* Functions which translate and install the shadows of arbitrary guest 
@@ -2725,54 +2802,6 @@ static int sh_page_fault(struct vcpu *v,
     //      bunch of 4K maps.
     //
 
-#if (SHADOW_OPTIMIZATIONS & SHOPT_FAST_FAULT_PATH) && SHADOW_PAGING_LEVELS > 2
-    if ( (regs->error_code & PFEC_reserved_bit) )
-    {
-        /* The only reasons for reserved bits to be set in shadow entries 
-         * are the two "magic" shadow_l1e entries. */
-        if ( likely((__copy_from_user(&sl1e, 
-                                      (sh_linear_l1_table(v) 
-                                       + shadow_l1_linear_offset(va)),
-                                      sizeof(sl1e)) == 0)
-                    && sh_l1e_is_magic(sl1e)) )
-        {
-            if ( sh_l1e_is_gnp(sl1e) )
-            {
-                /* Not-present in a guest PT: pass to the guest as
-                 * a not-present fault (by flipping two bits). */
-                ASSERT(regs->error_code & PFEC_page_present);
-                regs->error_code ^= (PFEC_reserved_bit|PFEC_page_present);
-                reset_early_unshadow(v);
-                perfc_incr(shadow_fault_fast_gnp);
-                SHADOW_PRINTK("fast path not-present\n");
-                return 0;
-            }
-            else
-            {
-                /* Magic MMIO marker: extract gfn for MMIO address */
-                ASSERT(sh_l1e_is_mmio(sl1e));
-                gpa = (((paddr_t)(gfn_x(sh_l1e_mmio_get_gfn(sl1e)))) 
-                       << PAGE_SHIFT) 
-                    | (va & ~PAGE_MASK);
-            }
-            perfc_incr(shadow_fault_fast_mmio);
-            SHADOW_PRINTK("fast path mmio %#"PRIpaddr"\n", gpa);
-            reset_early_unshadow(v);
-            handle_mmio(gpa);
-            return EXCRET_fault_fixed;
-        }
-        else
-        {
-            /* This should be exceptionally rare: another vcpu has fixed
-             * the tables between the fault and our reading the l1e. 
-             * Retry and let the hardware give us the right fault next time. */
-            perfc_incr(shadow_fault_fast_fail);
-            SHADOW_PRINTK("fast path false alarm!\n");            
-            return EXCRET_fault_fixed;
-        }
-    }
-#endif /* SHOPT_FAST_FAULT_PATH */
-
     /* Detect if this page fault happened while we were already in Xen
      * doing a shadow operation.  If that happens, the only thing we can
      * do is let Xen's normal fault handlers try to fix it.  In any case, 
@@ -2786,7 +2815,7 @@ static int sh_page_fault(struct vcpu *v,
     }
 
     shadow_lock(d);
-    
+ 
     shadow_audit_tables(v);
     
     if ( guest_walk_tables(v, va, &gw, regs->error_code, 1) != 0 )
@@ -2902,6 +2931,10 @@ static int sh_page_fault(struct vcpu *v,
 
     perfc_incr(shadow_fault_fixed);
     d->arch.paging.log_dirty.fault_count++;
+    
+    if (paging_mode_log_dirty(v->domain))
+        cow.pf_count++;
+
     reset_early_unshadow(v);
 
  done:
@@ -2979,35 +3012,6 @@ static int sh_page_fault(struct vcpu *v,
         shadow_remove_all_shadows(v, gmfn);
     }
 
-#if GUEST_PAGING_LEVELS == 3 /* PAE guest */
-    if ( r == X86EMUL_OKAY ) {
-        int i;
-        /* Emulate up to four extra instructions in the hope of catching 
-         * the "second half" of a 64-bit pagetable write. */
-        for ( i = 0 ; i < 4 ; i++ )
-        {
-            shadow_continue_emulation(&emul_ctxt, regs);
-            v->arch.paging.last_write_was_pt = 0;
-            r = x86_emulate(&emul_ctxt.ctxt, emul_ops);
-            if ( r == X86EMUL_OKAY )
-            {
-                if ( v->arch.paging.last_write_was_pt )
-                {
-                    perfc_incr(shadow_em_ex_pt);
-                    break; /* Don't emulate past the other half of the write */
-                }
-                else 
-                    perfc_incr(shadow_em_ex_non_pt);
-            }
-            else
-            {
-                perfc_incr(shadow_em_ex_fail);
-                break; /* Don't emulate again if we failed! */
-            }
-        }
-    }
-#endif /* PAE guest */
-
     SHADOW_PRINTK("emulated\n");
     return EXCRET_fault_fixed;
 
@@ -3015,6 +3019,7 @@ static int sh_page_fault(struct vcpu *v,
     if ( !guest_mode(regs) )
         goto not_a_shadow_fault;
     perfc_incr(shadow_fault_mmio);
+
     sh_audit_gw(v, &gw);
     SHADOW_PRINTK("mmio %#"PRIpaddr"\n", gpa);
     shadow_audit_tables(v);
@@ -3779,6 +3784,13 @@ sh_update_cr3(struct vcpu *v, int do_locking)
     vtlb_flush(v);
 #endif
 
+    /* CoW: keep track of last 'n' top-level directories */
+    if (!paging_mode_log_dirty(d))
+    {
+        cow.gl2mfn[1] = cow.gl2mfn[0];
+        cow.gl2mfn[0] = pagetable_get_mfn(v->arch.guest_table);
+    }
+    
     /* Release the lock, if we took it (otherwise it's the caller's problem) */
     if ( do_locking ) shadow_unlock(v->domain);
 }
@@ -4189,6 +4201,10 @@ sh_x86_emulate_write(struct vcpu *v, unsigned long vaddr, void *src,
                 X86EMUL_EXCEPTION : X86EMUL_UNHANDLEABLE);
     }
 
+    /* Do CoW before write occurs */
+    cow_copy_page(v->domain, sh_ctxt->mfn1);
+    cow_copy_page(v->domain, sh_ctxt->mfn2);
+
     memcpy(addr, src, bytes);
 
     emulate_unmap_dest(v, addr, bytes, sh_ctxt);
@@ -4219,6 +4235,10 @@ sh_x86_emulate_cmpxchg(struct vcpu *v, unsigned long vaddr,
         return ((addr == MAPPING_EXCEPTION) ?
                 X86EMUL_EXCEPTION : X86EMUL_UNHANDLEABLE);
     }
+
+    /* Do CoW before write occurs */
+    cow_copy_page(v->domain, sh_ctxt->mfn1);
+    cow_copy_page(v->domain, sh_ctxt->mfn2);
 
     switch ( bytes )
     {
@@ -4267,6 +4287,10 @@ sh_x86_emulate_cmpxchg8b(struct vcpu *v, unsigned long vaddr,
         return ((addr == MAPPING_EXCEPTION) ?
                 X86EMUL_EXCEPTION : X86EMUL_UNHANDLEABLE);
     }
+
+    /* Do CoW before write occurs */
+    cow_copy_page(v->domain, sh_ctxt->mfn1);
+    cow_copy_page(v->domain, sh_ctxt->mfn2);
 
     old = (((u64) old_hi) << 32) | (u64) old_lo;
     new = (((u64) new_hi) << 32) | (u64) new_lo;
@@ -4574,6 +4598,233 @@ struct paging_mode sh_paging_mode = {
 #endif
     .shadow.shadow_levels          = SHADOW_PAGING_LEVELS,
 };
+
+/* synchronize shadow l1pte from corresponding guest l1pte */
+void cow_update_shadows(struct vcpu *v, mfn_t gl2mfn)
+{
+    guest_l1e_t *gl1e, *gp;
+    shadow_l2e_t *sl2e;
+    shadow_l1e_t *sl1e;
+    int do_locking, done_l2 = 0, done_l1 = 0;
+    int flags_l2, flags_l1;
+    mfn_t sl2mfn = _mfn(INVALID_MFN);
+    mfn_t gl1mfn = _mfn(INVALID_MFN);
+    mfn_t sl1mfn = _mfn(INVALID_MFN);
+    mfn_t mfn;
+    unsigned long pfn;
+
+    if (gl2mfn == INVALID_MFN)
+        return;
+
+    do_locking = !shadow_locked_by_me(v->domain);
+    if (do_locking)
+    {
+        shadow_lock(v->domain);
+        if (unlikely(!paging_mode_log_dirty(v->domain)))
+        {
+            shadow_unlock(v->domain);
+            return;
+        }
+    }
+
+    sl2mfn = get_shadow_status(v, gl2mfn, SH_type_l2_shadow);
+    
+    if (sl2mfn == INVALID_MFN)
+        goto out;
+
+    if (mfn_to_shadow_page(sl2mfn)->type != SH_type_l2_shadow)
+        goto out;
+
+    SHADOW_FOREACH_L2E(sl2mfn, sl2e, 0, done_l2, v->domain,
+    {
+        flags_l2 = shadow_l2e_get_flags(*sl2e);
+        sl1mfn = shadow_l2e_get_mfn(*sl2e);
+        if ((flags_l2 & _PAGE_PRESENT) &&
+            (mfn_to_shadow_page(sl1mfn)->type == SH_type_l1_shadow))
+        {
+            gl1mfn = _mfn(mfn_to_shadow_page(sl1mfn)->backpointer);
+            gl1e = gp = sh_map_domain_page(gl1mfn);
+            
+            SHADOW_FOREACH_L1E(sl1mfn, sl1e, &gl1e, done_l1,
+            {
+                flags_l1 = shadow_l1e_get_flags(*sl1e);
+                if ((flags_l1 & _PAGE_PRESENT) && !(flags_l1 & _PAGE_RW))
+                {
+                    struct page_info *page;
+                    mfn = shadow_l1e_get_mfn(*sl1e);
+                    page = mfn_to_page(mfn);
+                    pfn = mfn_to_gfn(v->domain, mfn);
+
+                    log_dirty_lock(v->domain);
+                    if (mfn_valid(mfn) && 
+                        VALID_M2P(pfn) &&
+                        sh_mfn_is_dirty(v->domain, mfn) &&
+                        !sh_mfn_is_a_page_table(mfn) &&
+                        ((page->u.inuse.type_info & PGT_type_mask) 
+                            == PGT_writable_page) &&
+                        ((page->u.inuse.type_info & PGT_count_mask) == 0))
+                    {
+                         if (guest_l1e_get_flags(*gl1e) & _PAGE_RW)
+                         {
+                             int flags = 
+                                 __validate_gl1e(v, gl1e, sl1mfn, sl1e, 1);
+                             if (flags & SHADOW_SET_CHANGED)
+                                cow.made_rw_count++;
+                         }
+                    }
+                    log_dirty_unlock(v->domain);
+                }
+            });
+            sh_unmap_domain_page(gp);
+        }
+    });
+ 
+    /* flush it all down the drain */
+    vtlb_flush(v);
+    flush_tlb_all();
+
+out:
+    if (do_locking) 
+        shadow_unlock(v->domain);
+}
+
+/* walk through given address space and mark hot pfns */
+void cow_determine_hot(struct vcpu *v, mfn_t gl2mfn)
+{
+    shadow_l2e_t *sl2e;
+    shadow_l1e_t *sl1e;
+    int do_locking, done_l2 = 0, done_l1 = 0;
+    int flags_l2, flags_l1;
+    mfn_t sl1mfn = _mfn(INVALID_MFN);
+    mfn_t mfn, sl2mfn;
+    unsigned long pfn;
+
+    if (gl2mfn == INVALID_MFN)
+        return;
+
+    do_locking = !shadow_locked_by_me(v->domain);
+    if (do_locking)
+        shadow_lock(v->domain);
+
+    sl2mfn = get_shadow_status(v,
+                               gl2mfn,
+                               SH_type_l2_shadow);
+    if (sl2mfn == INVALID_MFN)
+        goto out;
+
+    if (mfn_to_shadow_page(sl2mfn)->type != SH_type_l2_shadow)
+        goto out;
+
+    SHADOW_FOREACH_L2E(sl2mfn, sl2e, 0, done_l2, v->domain,
+    {
+        flags_l2 = shadow_l2e_get_flags(*sl2e);
+        sl1mfn = shadow_l2e_get_mfn(*sl2e);
+        if (flags_l2 & _PAGE_PRESENT &&
+            (mfn_to_shadow_page(sl1mfn)->type == SH_type_l1_shadow))
+        {
+            SHADOW_FOREACH_L1E(sl1mfn, sl1e, 0, done_l1,
+            {
+                flags_l1 = shadow_l1e_get_flags(*sl1e);
+                if ((flags_l1 & _PAGE_PRESENT) && 
+                    (flags_l1 & _PAGE_DIRTY) &&
+                    (flags_l1 & _PAGE_RW))
+                {
+                    mfn = shadow_l1e_get_mfn(*sl1e);
+                    if (mfn_valid(mfn) && !sh_mfn_is_a_page_table(mfn))
+                    {
+                        pfn = mfn_to_gfn(v->domain, mfn);
+                        if (VALID_M2P(pfn) && 
+                            (gmfn_to_mfn(v->domain, pfn) == mfn))
+                        {
+                            /* Don't need to check log_dirty_bitmap since */
+                            /* we haven't turned on log dirty mode yet */
+                            cow.hot_count++;
+                            cow_set_bit(pfn, cow.hot_bitmap);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+out:
+    if (do_locking)
+        shadow_unlock(v->domain);
+}
+
+#ifdef COW_INVERSE_MAP
+/* add write access to shadow L1 PTEs mapping for the given mfn */
+/* using inverted mappings.  doesn't work right now. */
+void cow_add_writeable_mappings(struct vcpu *v, mfn_t mfn)
+{
+    struct invert_sh_entry *entry;
+    struct shadow_page_info *cur;
+    int do_locking;
+
+    do_locking = !shadow_locked_by_me(v->domain);
+    if (do_locking)
+    {
+        shadow_lock(v->domain);
+        if (unlikely(!paging_mode_log_dirty(v->domain)))
+        {
+            shadow_unlock(v->domain);
+            return;
+        }
+    }
+    
+    entry = invert_sh_table_lookup(mfn);
+    
+    cur = entry->sl1_list;
+    while (cur != NULL)
+    {
+        shadow_l1e_t *sl1e;
+        int done = 0, flags;
+        mfn_t sl1_mfn = shadow_page_to_mfn(cur);
+        unsigned long pfn;
+        
+        SHADOW_FOREACH_L1E(sl1_mfn, sl1e, 0, done,
+        {
+            flags = shadow_l1e_get_flags(*sl1e);
+            if ((flags & _PAGE_PRESENT) && (flags & _PAGE_RW) && 
+                (shadow_l1e_get_mfn(*sl1e) == mfn))
+            {
+                if (mfn_valid(mfn))
+                {
+                    struct page_info *page = mfn_to_page(mfn);
+                    if (((page->u.inuse.type_info & PGT_type_mask) ==
+                            PGT_writable_page)
+                        && ((page->u.inuse.type_info & PGT_count_mask) == 0))
+                    {
+                        pfn = mfn_to_gfn(v->domain, mfn);
+                        if (VALID_M2P(pfn) && 
+                           (gmfn_to_mfn(v->domain, pfn) == mfn))
+                        {
+                            log_dirty_lock(v->domain);
+                            if (sh_mfn_is_dirty(v->domain, mfn)) 
+                            {
+                                shadow_l1e_t rw_sl1e;
+                                rw_sl1e = shadow_l1e_add_flags(*sl1e, _PAGE_RW);
+                                __shadow_set_l1e(v, sl1e, rw_sl1e, sl1_mfn, 1);
+                                cow.made_rw_count++;
+                            }
+                            log_dirty_unlock(v->domain);
+                        }
+                    }
+                }
+            }
+        });
+        cur = cur->next_entry;
+    }
+    flush_tlb_all();
+    vtlb_flush();
+
+    if (do_locking) 
+        shadow_unlock(v->domain);
+}
+#endif
+
+
+
 
 /*
  * Local variables:

@@ -1932,7 +1932,7 @@ class XendDomainInfo:
         self._cleanup_phantom_devs(paths)
 
 
-    def resumeDomain(self):
+    def resumeDomain(self, downtime):
         log.debug("XendDomainInfo.resumeDomain(%s)", str(self.domid))
 
         # resume a suspended domain (e.g. after live checkpoint, or after
@@ -1973,6 +1973,10 @@ class XendDomainInfo:
             ResumeDomain(self.domid)
         except:
             log.exception("XendDomainInfo.resume: xc.domain_resume failed on domain %s." % (str(self.domid)))
+
+        # CoW timing
+        downtime.append(time.time())
+
         self.image.resumeDeviceModel()
         log.debug("XendDomainInfo.resumeDomain: completed")
 

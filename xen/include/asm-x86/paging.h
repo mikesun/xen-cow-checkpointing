@@ -33,6 +33,36 @@
 #include <asm/flushtlb.h>
 #include <asm/domain.h>
 
+#define log_dirty_lock_init(_d)                                   \
+    do {                                                          \
+        spin_lock_init(&(_d)->arch.paging.log_dirty.lock);        \
+        (_d)->arch.paging.log_dirty.locker = -1;                  \
+        (_d)->arch.paging.log_dirty.locker_function = "nobody";   \
+    } while (0)
+
+#define log_dirty_lock(_d)                                                   \
+    do {                                                                     \
+        if (unlikely((_d)->arch.paging.log_dirty.locker==current->processor))\
+        {                                                                    \
+            printk("Error: paging log dirty lock held by %s\n",              \
+                   (_d)->arch.paging.log_dirty.locker_function);             \
+            BUG();                                                           \
+        }                                                                    \
+        spin_lock(&(_d)->arch.paging.log_dirty.lock);                        \
+        ASSERT((_d)->arch.paging.log_dirty.locker == -1);                    \
+        (_d)->arch.paging.log_dirty.locker = current->processor;             \
+        (_d)->arch.paging.log_dirty.locker_function = __func__;              \
+    } while (0)
+
+#define log_dirty_unlock(_d)                                              \
+    do {                                                                  \
+        ASSERT((_d)->arch.paging.log_dirty.locker == current->processor); \
+        (_d)->arch.paging.log_dirty.locker = -1;                          \
+        (_d)->arch.paging.log_dirty.locker_function = "nobody";           \
+        spin_unlock(&(_d)->arch.paging.log_dirty.lock);                   \
+    } while (0)
+
+
 /*****************************************************************************
  * Macros to tell which paging mode a domain is in */
 
@@ -150,7 +180,16 @@ void paging_log_dirty_init(struct domain *d,
                            void (*clean_dirty_bitmap)(struct domain *d));
 
 /* mark a page as dirty */
-void paging_mark_dirty(struct domain *d, unsigned long guest_mfn);
+void _paging_mark_dirty(struct domain *d, unsigned long guest_mfn, 
+                        int do_locking);
+
+/* Modified by CoW */
+static inline void paging_mark_dirty(struct domain *d, unsigned long guest_mfn)
+{
+    _paging_mark_dirty(d, guest_mfn, 1);
+}
+
+int paging_log_dirty_op(struct domain *d, struct xen_domctl_shadow_op *sc);
 
 /*
  * Log-dirty radix tree indexing:

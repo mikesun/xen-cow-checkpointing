@@ -1,6 +1,8 @@
 /******************************************************************************
  * arch/x86/mm/shadow/common.c
  *
+ * Modifed for CoW by Mike Sun.
+ *
  * Shadow code that does not need to be multiply compiled.
  * Parts of this code are Copyright (c) 2006 by XenSource Inc.
  * Parts of this code are Copyright (c) 2006 by Michael A Fetterman
@@ -31,13 +33,17 @@
 #include <xen/domain_page.h>
 #include <xen/guest_access.h>
 #include <xen/keyhandler.h>
+#include <public/hvm/e820.h>
 #include <asm/event.h>
 #include <asm/page.h>
+#include <asm/p2m.h>
 #include <asm/current.h>
 #include <asm/flushtlb.h>
 #include <asm/shadow.h>
 #include "private.h"
 
+/* CoW Data Structures */
+struct cow_data cow;
 
 /* Set up the shadow-specific parts of a domain struct at start of day.
  * Called for every domain from arch_domain_create() */
@@ -616,6 +622,10 @@ int shadow_write_guest_entry(struct vcpu *v, intpte_t *p,
 {
     int failed;
     shadow_lock(v->domain);
+
+    /* Do CoW before write occurs */
+    cow_copy_page(v->domain, gmfn);
+
     failed = __copy_to_user(p, &new, sizeof(new));
     if ( failed != sizeof(new) )
         sh_validate_guest_entry(v, gmfn, p, sizeof(new));
@@ -633,6 +643,10 @@ int shadow_cmpxchg_guest_entry(struct vcpu *v, intpte_t *p,
     int failed;
     intpte_t t = *old;
     shadow_lock(v->domain);
+
+    /* Do CoW before write occurs */
+    cow_copy_page(v->domain, gmfn);
+
     failed = cmpxchg_user(p, t, new);
     if ( t == *old )
         sh_validate_guest_entry(v, gmfn, p, sizeof(new));
@@ -1586,6 +1600,157 @@ static void hash_foreach(struct vcpu *v,
     d->arch.paging.shadow.hash_walking = 0; 
 }
 
+
+/**************************************************************************/
+/* Inverted shadow hash table
+ * Hash table for storing the mfn -> shadow L1 PTEs mappings. */
+/*
+static inline key_t invert_sh_hash(mfn_t mfn) 
+{
+    unsigned char *p = (unsigned char *) &mfn;
+    key_t k = 1;
+    int i;
+    for (i = 0; i < sizeof(mfn); i++ ) 
+        k = (u32)p[i] + (k<<6) + (k<<16) - k;
+    return k % SHADOW_HASH_BUCKETS;
+}
+
+int invert_sh_table_alloc()
+{
+    struct invert_sh_entry **table;
+
+    table = xmalloc_array(struct invert_sh_entry *, 
+                          SHADOW_HASH_BUCKETS);
+    if (!table) 
+        return 1;
+    memset(table, 0, 
+           SHADOW_HASH_BUCKETS * sizeof(struct invert_sh_entry *));
+    cow.invert_sh_table = table;
+
+    printk("invert_sh_table allocated\n");
+
+    return 0;
+}
+
+void invert_sh_table_teardown()
+{
+    printk("invert_sh_table_teardown()\n");
+    if (cow.invert_sh_table != NULL)
+    {
+        int i;
+        for (i = 0; i < SHADOW_HASH_BUCKETS; i++)
+        {
+            while (cow.invert_sh_table[i] != NULL)
+            {
+                struct invert_sh_entry *entry = cow.invert_sh_table[i];
+                cow.invert_sh_table[i] = entry->next_entry;
+                xfree(entry);
+            }
+        }
+        xfree(cow.invert_sh_table);
+    }
+    cow.invert_sh_table = NULL;
+}
+
+struct invert_sh_entry * invert_sh_table_lookup(mfn_t mfn)
+{
+    struct invert_sh_entry *cur, *prev;
+    key_t key;
+    key = invert_sh_hash(mfn);
+
+    if (cow.invert_sh_table == NULL)
+        return NULL;
+
+    cur = cow.invert_sh_table[key];
+    prev = NULL;
+    while (cur)
+    {
+        if (cur->mfn == mfn)
+        {
+            if (unlikely(cur != cow.invert_sh_table[key]) )
+            {
+                ASSERT(prev);
+                prev->next_entry = cur->next_entry;                    
+                cur->next_entry = cow.invert_sh_table[key];
+                cow.invert_sh_table[key] = cur;
+            }
+            return cur;
+        }
+        prev = cur;
+        cur = cur->next_entry;
+    }
+    return NULL;
+}
+
+void invert_sh_table_add_entry(mfn_t mfn, struct invert_sh_entry *entry)
+{   
+    key_t key = invert_sh_hash(mfn);
+
+    ASSERT(cow.invert_sh_table != NULL);
+    ASSERT(entry != NULL);
+   
+    entry->next_entry = cow.invert_sh_table[key];
+    cow.invert_sh_table[key] = entry;
+}
+
+void invert_sh_table_insert(mfn_t mfn, mfn_t sl1mfn)
+{
+    struct invert_sh_entry *entry = NULL;
+
+    if (!cow.invert_sh_table)
+        invert_sh_table_alloc();
+    else
+        entry = invert_sh_table_lookup(mfn);
+        
+    if (!entry)
+    {
+        entry = (struct invert_sh_entry *) 
+            xmalloc(struct invert_sh_entry);
+                if (unlikely(!entry))
+        {
+            SHADOW_ERROR("Could not allocate invert_sh_entry\n");
+            return;
+        }
+        entry->next_entry = NULL;
+        entry->sl1_list = NULL;
+        entry->mfn = mfn;
+        invert_sh_table_add_entry(mfn, entry);
+    }
+    entry->sl1_list = sl1_list_insert(entry->sl1_list, sl1mfn);
+}
+
+void invert_sh_table_remove(mfn_t mfn, mfn_t sl1mfn)
+{
+    key_t key;
+    struct invert_sh_entry *cur = NULL;
+    struct invert_sh_entry *prev = NULL;
+
+    if (cow.invert_sh_table == NULL)
+        return;
+    
+        key = invert_sh_hash(mfn);
+        cur = cow.invert_sh_table[key];
+        prev = cur;
+        while (cur != NULL)
+        {
+            if (cur->mfn == mfn)
+            {
+                cur->sl1_list = sl1_list_remove(cur->sl1_list, sl1mfn);
+                if (cur->sl1_list == NULL)
+                {
+                    if (cur == cow.invert_sh_table[key])                
+                        cow.invert_sh_table[key] = cur->next_entry;
+                    else
+                        prev->next_entry = cur->next_entry;
+                    xfree(cur);
+                }
+                return;
+            }
+            prev = cur;
+            cur = cur->next_entry;
+        }
+}
+*/
 
 /**************************************************************************/
 /* Destroy a shadow page: simple dispatcher to call the per-type destructor
@@ -2807,6 +2972,216 @@ shadow_write_p2m_entry(struct vcpu *v, unsigned long gfn,
 }
 
 /**************************************************************************/
+/* Copy-on-Write (CoW) mode support */
+static int shadow_cow_op(struct domain *d, struct xen_domctl_shadow_op *sc)
+{
+    if (sc->op == XEN_DOMCTL_SHADOW_COW_ON)
+    {
+        l1_pgentry_t eff_l1e;
+        unsigned long gva;
+        int i;
+
+        cow.dom = d;
+        cow.counter = 0;
+        cow.update_shadows = 0;
+        cow.do_update = 0;
+
+        cow.pf_count = 0;
+        cow.batches_count = 0;
+        cow.made_rw_count = 0;
+        cow.hot_count = 0;
+        cow.ioemu_count = 0;
+
+        cow.pages_mfns_size = sc->pages;
+        cow.cpt_mfns_size = COW_TYPE_FN(sc->pages - 1) + 1;
+
+        cow.pages_mfns = (unsigned long *) 
+            xmalloc_array(unsigned long, cow.pages_mfns_size);
+        if (cow.pages_mfns == NULL) { 
+             printk("Unable to allocate cow.pages_mfns\n");
+             return -ENOMEM;
+        }
+
+        cow.cpt_mfns = (unsigned long *) 
+            xmalloc_array(unsigned long, cow.cpt_mfns_size);
+        if (cow.cpt_mfns == NULL) {
+             printk("Unable to allocate cow.cpt_mfns\n");
+             return -ENOMEM;
+        }
+
+        /* translate guest pages to mfns for pages_mfns buffer */
+        shadow_lock(d);
+        gva = (unsigned long) sc->cow_pages.q;
+        for (i = 0; i < cow.pages_mfns_size; i++)
+        {
+            guest_get_eff_l1e(current, gva, &eff_l1e);
+            cow.pages_mfns[i] = (unsigned long) l1e_get_pfn(eff_l1e);
+            gva += PAGE_SIZE;
+        }
+        shadow_unlock(d);
+
+        /* translate guest pages to mfns for pfn_types_mfns buffer */
+        shadow_lock(d);
+        gva = (unsigned long) sc->cow_pfn_types.q;
+        for (i = 0; i < cow.cpt_mfns_size; i++)
+        {
+            guest_get_eff_l1e(current, gva, &eff_l1e);
+            cow.cpt_mfns[i] = (unsigned long) l1e_get_pfn(eff_l1e);
+            gva += PAGE_SIZE;
+        }
+        shadow_unlock(d);
+        
+        /* setup hot bitmap */
+        cow.hot_bitmap = (unsigned long *) xmalloc_array(char, COW_BITMAP_SIZE);
+        if (cow.hot_bitmap == NULL)
+        { 
+            printk("Unable to allocate cow.hot_bitmap\n");
+            return -ENOMEM;
+        }
+        memset(cow.hot_bitmap, 0, COW_BITMAP_SIZE);
+        
+        // should pause domain, or will getting the shadow lock be enough?
+        if (!paging_mode_log_dirty(d))
+        {
+            cow_determine_hot(d->vcpu[0], cow.gl2mfn[0]);
+            cow_determine_hot(d->vcpu[0], cow.gl2mfn[1]);
+        }
+        copy_to_guest_offset(sc->hot_bitmap, 
+                             0, 
+                             (void *) cow.hot_bitmap, 
+                             COW_BITMAP_SIZE);
+                             
+        xfree(cow.hot_bitmap);
+
+        /* calculate how many batch updates we should allow to update shadows */
+        if ((cow.hot_count % 1024) > 0)
+            cow.update_shadows = (cow.hot_count / 1024) + 1;
+        else
+            cow.update_shadows = cow.hot_count / 1024;
+        printk("CoW: cow.update_shadows = %lu\n", cow.update_shadows);
+
+        return paging_log_dirty_enable(d);
+    }
+    else if (sc->op == XEN_DOMCTL_SHADOW_COW_OFF)
+    {
+        int ret = 0;
+       
+        /* turn off cow/log_dirty */ 
+        paging_log_dirty_disable(d);
+
+        /* copy final cow count to dom0 */
+        copy_to_guest_offset(sc->cow_count, 0, (void *) &(cow.counter), 
+                             sizeof(unsigned long));      
+
+#ifdef COW_INVERSE_MAP
+        /* tear down our inverse mappings */
+        invert_sh_table_teardown(); 
+#endif
+
+        printk("CoW: page faults during migration = %lu\n", cow.pf_count);
+        printk("CoW: batches marked dirty = %lu\n", cow.batches_count);
+        printk("CoW: pages identified as hot = %lu\n", cow.hot_count);
+        printk("CoW: mappings made writable = %lu\n", cow.made_rw_count);
+        printk("CoW: ioemu hypercalls = %lu\n", cow.ioemu_count);
+
+        cow.dom = NULL;
+        cow.gl2mfn[0] = INVALID_MFN;
+        cow.gl2mfn[1] = INVALID_MFN;
+        cow.counter = 0;
+        cow.pages_mfns_size = 0;
+        xfree(cow.pages_mfns);
+        cow.cpt_mfns_size = 0;
+        xfree(cow.cpt_mfns);
+  
+        return ret;
+    }
+    else if (sc->op == XEN_DOMCTL_SHADOW_COW_MARK_DIRTY)
+    {
+        int i;
+        unsigned long batch_size = sc->pages;
+        XEN_GUEST_HANDLE_64(uint8) hdl = sc->cow_pfn_types;
+        unsigned long *pfn_batch;
+
+        cow.batches_count++;
+        
+        pfn_batch = (unsigned long *) xmalloc_array(unsigned long, batch_size);
+        if (pfn_batch == NULL)
+        {
+            printk("Unable to allocate pfn_batch in COW_MARK_DIRTY\n");
+            return -ENOMEM;
+        }
+        copy_from_guest_offset((void *) pfn_batch, hdl, 
+                               0, batch_size * sizeof(unsigned long));
+
+        for (i = 0; i < batch_size; i++)
+        {
+            mfn_t mfn;
+            unsigned long pfn = pfn_batch[i] & ~XEN_DOMCTL_PFINFO_LTAB_MASK;
+
+            mfn = gmfn_to_mfn(d, pfn);
+            if (mfn_valid(mfn) && (mfn_to_gfn(d, mfn) == pfn)) 
+            {
+                paging_mark_dirty(d, mfn);
+#ifdef COW_INVERSE_MAP
+                cow_add_writeable_mappings(d->vcpu[0], mfn);
+#endif
+            }
+        }
+        xfree(pfn_batch);
+
+        /* probably need to update shadows as many times as batch update 
+         * includes hot pages  */
+        if (cow.update_shadows > 0)
+        {
+            cow_update_shadows(d->vcpu[0], cow.gl2mfn[0]);
+            cow_update_shadows(d->vcpu[0], cow.gl2mfn[1]);
+            cow_update_shadows(d->vcpu[0], 
+                               pagetable_get_mfn(d->vcpu[0]->arch.guest_table));
+            cow.update_shadows--;
+        }
+        
+        /* update external dirty_bitmap for copy domain */
+        if (paging_log_dirty_op(d, sc))
+            printk("CoW: mark_dirty: paging_log_dirty_op() failed\n");
+
+        return 0;
+    }
+    else if (sc->op == XEN_DOMCTL_SHADOW_COW_COPY)
+    {
+        mfn_t mfn;
+        unsigned long pfn;
+
+        cow.ioemu_count++;
+
+        pfn = sc->pfn;
+        if (((pfn >= 0xa0 && pfn < 0xc0)
+                 || (pfn >= (HVM_BELOW_4G_MMIO_START >> PAGE_SHIFT)
+                            && pfn < (1ULL<<32) >> PAGE_SHIFT))) 
+            return 0;
+
+        shadow_lock(d);
+        mfn = gmfn_to_mfn(d, pfn);
+        if (mfn_valid(mfn) && (mfn_to_gfn(d, mfn) == pfn)) 
+            cow_copy_page(d, mfn);
+            
+        /* update external dirty_bitmap for copy domain */
+        if (paging_mode_log_dirty(d))
+        {
+            if (paging_log_dirty_op(d, sc))
+                printk("CoW: from ioemu, paging_log_dirty_op() failed\n");
+        }
+        shadow_unlock(d);
+
+        return 0;
+    }
+    else 
+    {
+        /* Improper op */
+        return 1;
+    }
+}
+
+/**************************************************************************/
 /* Log-dirty mode support */
 
 /* Shadow specific code which is called in paging_log_dirty_enable().
@@ -2876,6 +3251,12 @@ int shadow_domctl(struct domain *d,
 
     switch ( sc->op )
     {
+    case XEN_DOMCTL_SHADOW_COW_ON:
+    case XEN_DOMCTL_SHADOW_COW_OFF:
+    case XEN_DOMCTL_SHADOW_COW_COPY:
+    case XEN_DOMCTL_SHADOW_COW_MARK_DIRTY:
+        return shadow_cow_op(d, sc);
+
     case XEN_DOMCTL_SHADOW_OP_OFF:
         if ( d->arch.paging.mode == PG_SH_enable )
             if ( (rc = shadow_test_disable(d)) != 0 ) 

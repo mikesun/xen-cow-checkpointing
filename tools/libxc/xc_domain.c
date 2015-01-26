@@ -347,6 +347,10 @@ int xc_shadow_control(int xc_handle,
     domctl.u.shadow_op.mode   = mode;
     set_xen_guest_handle(domctl.u.shadow_op.dirty_bitmap,
                          (uint8_t *)dirty_bitmap);
+    set_xen_guest_handle(domctl.u.shadow_op.cow_pages,
+                         (uint8_t *) NULL);
+    set_xen_guest_handle(domctl.u.shadow_op.cow_pfn_types,
+                         (uint8_t *) NULL);
 
     rc = do_domctl(xc_handle, &domctl);
 
@@ -356,6 +360,43 @@ int xc_shadow_control(int xc_handle,
     
     if ( mb ) 
         *mb = domctl.u.shadow_op.mb;
+
+    return (rc == 0) ? domctl.u.shadow_op.pages : rc;
+}
+
+int xc_cow_shadow_control(int xc_handle,
+                          uint32_t domid,
+                          unsigned int sop,
+                          unsigned long *hot_bitmap,
+                          unsigned long *cow_pages,
+                          unsigned long *cow_pfn_types,
+                          unsigned long *cow_count,
+                          unsigned long *cow_bitmap,
+                          unsigned long pages,
+                          unsigned long pfn,
+                          uint32_t mode)
+{
+    int rc;
+    DECLARE_DOMCTL;
+    domctl.cmd = XEN_DOMCTL_shadow_op;
+    domctl.domain = (domid_t) domid;
+    domctl.u.shadow_op.op     = sop;
+    domctl.u.shadow_op.pages  = pages;
+    domctl.u.shadow_op.mb     = 0;
+    domctl.u.shadow_op.mode   = mode;
+    domctl.u.shadow_op.pfn    = pfn;
+    set_xen_guest_handle(domctl.u.shadow_op.dirty_bitmap,
+                         (uint8_t *) cow_bitmap);
+    set_xen_guest_handle(domctl.u.shadow_op.hot_bitmap,
+                         (uint8_t *) hot_bitmap);
+    set_xen_guest_handle(domctl.u.shadow_op.cow_pages,
+                         (uint8_t *) cow_pages);
+    set_xen_guest_handle(domctl.u.shadow_op.cow_pfn_types,
+                         (uint8_t *) cow_pfn_types);
+    set_xen_guest_handle(domctl.u.shadow_op.cow_count,
+                         (uint8_t *) cow_count);
+
+    rc = do_domctl(xc_handle, &domctl);
 
     return (rc == 0) ? domctl.u.shadow_op.pages : rc;
 }

@@ -10,7 +10,7 @@ XEN_TARGET_ARCH     ?= $(XEN_COMPILE_ARCH)
 XEN_OS              ?= $(shell uname -s)
 
 ifeq ($(XEN_TARGET_ARCH),x86_32)
-XEN_TARGET_X86_PAE  ?= y
+XEN_TARGET_X86_PAE  ?= n 
 endif
 
 CONFIG_$(XEN_OS) := y

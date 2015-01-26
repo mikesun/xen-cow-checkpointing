@@ -163,6 +163,12 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_getpageframeinfo2_t);
  */
 #define XEN_DOMCTL_shadow_op         10
 
+/* CoW operations */
+#define XEN_DOMCTL_SHADOW_COW_ON     13
+#define XEN_DOMCTL_SHADOW_COW_OFF    14
+#define XEN_DOMCTL_SHADOW_COW_COPY   15
+#define XEN_DOMCTL_SHADOW_COW_MARK_DIRTY 16
+
 /* Disable shadow mode. */
 #define XEN_DOMCTL_SHADOW_OP_OFF         0
 
@@ -215,6 +221,7 @@ struct xen_domctl_shadow_op_stats {
 typedef struct xen_domctl_shadow_op_stats xen_domctl_shadow_op_stats_t;
 DEFINE_XEN_GUEST_HANDLE(xen_domctl_shadow_op_stats_t);
 
+/* CoW stuff */
 struct xen_domctl_shadow_op {
     /* IN variables. */
     uint32_t       op;       /* XEN_DOMCTL_SHADOW_OP_* */
@@ -227,6 +234,16 @@ struct xen_domctl_shadow_op {
 
     /* OP_PEEK / OP_CLEAN */
     XEN_GUEST_HANDLE_64(uint8) dirty_bitmap;
+    
+    /* CoW mode op handles */
+    XEN_GUEST_HANDLE_64(uint8) hot_bitmap;
+    XEN_GUEST_HANDLE_64(uint8) cow_pages;
+    XEN_GUEST_HANDLE_64(uint8) cow_pfn_types;
+    XEN_GUEST_HANDLE_64(uint8) cow_count;
+
+    /* CoW copy op page info */
+    unsigned long pfn;
+
     uint64_aligned_t pages; /* Size of buffer. Updated with actual size. */
     struct xen_domctl_shadow_op_stats stats;
 };

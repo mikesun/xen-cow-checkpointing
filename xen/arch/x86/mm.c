@@ -613,9 +613,7 @@ int is_iomem_page(unsigned long mfn)
 }
 
 
-int
-get_page_from_l1e(
-    l1_pgentry_t l1e, struct domain *d)
+int __get_page_from_l1e(l1_pgentry_t l1e, struct domain *d, int cow_reset)
 {
     unsigned long mfn = l1e_get_pfn(l1e);
     struct page_info *page = mfn_to_page(mfn);
@@ -636,8 +634,9 @@ get_page_from_l1e(
     {
         /* DOMID_IO reverts to caller for privilege checks. */
         if ( d == dom_io )
+        {
             d = curr->domain;
-
+        }
         if ( !iomem_access_permitted(d, mfn, mfn) )
         {
             if ( mfn != (PADDR_MASK >> PAGE_SHIFT) ) /* INVALID_MFN? */
@@ -654,7 +653,8 @@ get_page_from_l1e(
      * qemu-dm helper process in dom0 to map the domain's memory without
      * messing up the count of "real" writable mappings.) */
     okay = (((l1f & _PAGE_RW) && 
-             !(unlikely(paging_mode_external(d) && (d != curr->domain))))
+             !(unlikely(paging_mode_external(d) && 
+                (!cow_reset && (d != curr->domain)))))
             ? get_page_and_type(page, d, PGT_writable_page)
             : get_page(page, d));
     if ( !okay )
@@ -674,7 +674,7 @@ get_page_from_l1e(
         {
             if ( (l1f & _PAGE_RW) &&
                  !(unlikely(paging_mode_external(d) &&
-                            (d != curr->domain))) )
+                     (!cow_reset && (d != curr->domain)))))
                 put_page_type(page);
             put_page(page);
             MEM_LOG("Attempt to change cache attributes of Xen heap page");
@@ -696,6 +696,7 @@ get_page_from_l1e(
 
     return okay;
 }
+
 
 
 /* NB. Virtual address 'l2e' maps to a machine address within frame 'pfn'. */
@@ -1680,7 +1681,11 @@ static int alloc_page_type(struct page_info *page, unsigned long type)
 
     /* A page table is dirtied when its type count becomes non-zero. */
     if ( likely(owner != NULL) )
+    {
+        /* Do CoW before write occurs */
+        cow_copy_page(owner, page_to_mfn(page));
         paging_mark_dirty(owner, page_to_mfn(page));
+    }
 
     switch ( type & PGT_type_mask )
     {
@@ -1713,6 +1718,9 @@ void free_page_type(struct page_info *page, unsigned long type)
 
     if ( likely(owner != NULL) )
     {
+        /* Do CoW before write occurs */
+        cow_copy_page(owner, page_to_mfn(page));
+
         /*
          * We have to flush before the next use of the linear mapping
          * (e.g., update_va_mapping()) or we could end up modifying a page
@@ -2180,6 +2188,9 @@ int do_mmuext_op(
             type = PGT_l4_page_table;
 
         pin_page:
+            /* Do CoW before write occurs */
+            cow_copy_page(d, mfn);
+
             rc = xsm_memory_pin_page(d, page);
             if ( rc )
                 break;
@@ -2228,6 +2239,9 @@ int do_mmuext_op(
         case MMUEXT_UNPIN_TABLE:
             if ( paging_mode_refcounts(d) )
                 break;
+
+            /* Do CoW before write occurs */
+            cow_copy_page(d, mfn);
 
             if ( unlikely(!(okay = get_page_from_pagenr(mfn, d))) )
             {
@@ -2562,6 +2576,9 @@ int do_mmu_update(
 
             mfn = req.ptr >> PAGE_SHIFT;
             gpfn = req.val;
+
+            /* Do CoW before write occurs */
+            cow_copy_page(FOREIGNDOM, mfn);
 
             rc = xsm_mmu_machphys_update(d, mfn);
             if ( rc )
@@ -3164,7 +3181,9 @@ long do_update_descriptor(u64 pa, u64 desc)
             goto out;
         break;
     }
-
+    
+    /* Do CoW before write occurs */
+    cow_copy_page(dom, mfn);
     paging_mark_dirty(dom, mfn);
 
     /* All is good so make the update. */

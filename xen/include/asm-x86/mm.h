@@ -155,8 +155,13 @@ void put_page(struct page_info *page);
 int  get_page(struct page_info *page, struct domain *domain);
 void put_page_type(struct page_info *page);
 int  get_page_type(struct page_info *page, unsigned long type);
-int  get_page_from_l1e(l1_pgentry_t l1e, struct domain *d);
+int  __get_page_from_l1e(l1_pgentry_t l1e, struct domain *d, int cow_reset);
 void put_page_from_l1e(l1_pgentry_t l1e, struct domain *d);
+
+static inline int get_page_from_l1e(l1_pgentry_t l1e, struct domain *d)
+{
+    return __get_page_from_l1e(l1e, d, 0);
+}
 
 static inline void put_page_and_type(struct page_info *page)
 {
@@ -357,5 +362,13 @@ unsigned int domain_clamp_alloc_bitsize(struct domain *d, unsigned int bits);
 #endif
 
 unsigned long domain_get_maximum_gpfn(struct domain *d);
+
+static inline int is_cow(mfn_t mfn, struct page_info *page)
+{
+    if (!is_iomem_page(mfn) && !is_xen_heap_page(page))
+        return 1;
+    else
+        return 0;
+}
 
 #endif /* __ASM_X86_MM_H__ */

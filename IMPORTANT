@@ -1,0 +1,2 @@
+In linux src tree:
+hg export 616 | patch -Rp1

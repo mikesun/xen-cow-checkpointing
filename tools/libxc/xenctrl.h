@@ -400,6 +400,18 @@ int xc_shadow_control(int xc_handle,
                       uint32_t mode,
                       xc_shadow_op_stats_t *stats);
 
+int xc_cow_shadow_control(int xc_handle,
+                        uint32_t domid,
+                        unsigned int sop,
+                        unsigned long *hot_bitmap,
+                        unsigned long *cow_pages,
+                        unsigned long *cow_pfn_types,
+                        unsigned long *cow_count,
+                        unsigned long *cow_bitmap,
+                        unsigned long pages,
+                        unsigned long pfn,
+                        uint32_t mode);
+
 int xc_sedf_domain_set(int xc_handle,
                        uint32_t domid,
                        uint64_t period, uint64_t slice,

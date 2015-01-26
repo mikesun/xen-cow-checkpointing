@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include "xenctrl.h"
 #include "xs.h"
 

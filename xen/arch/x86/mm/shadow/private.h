@@ -65,7 +65,6 @@ extern int shadow_audit_enable;
 
 #define SHADOW_OPTIMIZATIONS      0x7f
 
-
 /******************************************************************************
  * Debug and error-message output
  */
@@ -209,7 +208,8 @@ extern void shadow_audit_tables(struct vcpu *v);
 #undef SHADOW_LEVELS
 #endif /* CONFIG_PAGING_LEVELS == 4 */
 
-/******************************************************************************
+
+/*****************************************************************************
  * Page metadata for shadow pages.
  */
 
@@ -224,8 +224,12 @@ struct shadow_page_info
     union {
         /* When in use, next shadow in this hash chain */
         struct shadow_page_info *next_shadow;
-        /* When free, TLB flush time when freed */
-        u32 tlbflush_timestamp;
+        union {
+            /* When free, TLB flush time when freed */
+            u32 tlbflush_timestamp;
+            /* when in use, next shadow on inverted table hash chain */
+            struct shadow_page_info *next_entry;
+        };
     };
     struct {
         unsigned int type:4;      /* What kind of shadow is this? */
@@ -646,6 +650,70 @@ static inline void sh_unpin(struct vcpu *v, mfn_t smfn)
         sh_put_ref(v, smfn, 0);
     }
 }
+
+/* CoW MACROS */
+#define COW_TYPE_FN(_i) ((_i)/(PAGE_SIZE/sizeof(unsigned long)))
+#define COW_TYPE_IX(_i) ((_i)%(PAGE_SIZE/sizeof(unsigned long)))
+
+/*****************************************************************************
+ * CoW stuff 
+ */
+#define COW_BITMAP_SIZE 131072
+#define COW_BITMAP_ENTRY(_nr,_bmap) \
+   ((volatile unsigned long *)(_bmap))[(_nr)/BITS_PER_LONG]
+#define COW_BITMAP_SHIFT(_nr) ((_nr) % BITS_PER_LONG)
+
+static inline int cow_test_bit (int nr, volatile void * addr)
+{
+    return (COW_BITMAP_ENTRY(nr, addr) >> COW_BITMAP_SHIFT(nr)) & 1;
+}
+
+static inline void cow_clear_bit (int nr, volatile void * addr)
+{
+    COW_BITMAP_ENTRY(nr, addr) &= ~(1UL << COW_BITMAP_SHIFT(nr));
+}
+
+static inline void cow_set_bit (int nr, volatile void * addr)
+{
+    COW_BITMAP_ENTRY(nr, addr) |= (1UL << COW_BITMAP_SHIFT(nr));
+}
+
+#ifdef COW_INVERSE_MAP
+int invert_sh_table_alloc(void);
+void invert_sh_table_teardown(void);
+struct invert_sh_entry * invert_sh_table_lookup(mfn_t mfn);
+void invert_sh_table_add_entry(mfn_t mfn, struct invert_sh_entry *entry);
+void invert_sh_table_insert(mfn_t mfn, mfn_t sl1mfn);
+void invert_sh_table_remove(mfn_t mfn, mfn_t sl1mfn);
+
+struct invert_sh_entry
+{
+	mfn_t mfn;
+	struct shadow_page_info *sl1_list;
+	struct invert_sh_entry *next_entry;
+};
+#endif
+
+struct cow_data
+{
+    struct domain *dom;
+    unsigned long counter;
+    unsigned long *pages_mfns;
+    unsigned long pages_mfns_size;
+    unsigned long *cpt_mfns;
+    unsigned long cpt_mfns_size;
+    unsigned long gl2mfn[2];
+    unsigned long update_shadows;
+    unsigned long do_update;
+    unsigned long *hot_bitmap;
+
+    unsigned long pf_count;
+    unsigned long batches_count;
+    unsigned long made_rw_count;
+    unsigned long hot_count;
+    unsigned long ioemu_count;
+};
+
 
 
 /**************************************************************************/

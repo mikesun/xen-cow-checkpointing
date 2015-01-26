@@ -10,6 +10,7 @@ import os.path
 import re
 import string
 import threading
+import time
 import fcntl
 from struct import pack, unpack, calcsize
 
@@ -58,6 +59,15 @@ def read_exact(fd, size, errmsg):
 
 def save(fd, dominfo, network, live, dst, checkpoint=False):
     write_exact(fd, SIGNATURE, "could not write guest state file: signature")
+    
+    # CoW timing
+    checkpointtime = []
+    downtime = []
+
+    buf_list = []
+
+    # Cow timing
+    checkpointtime.append(time.time())
 
     config = sxp.to_string(dominfo.sxpr())
 
@@ -86,47 +96,63 @@ def save(fd, dominfo, network, live, dst, checkpoint=False):
         cmd = [xen.util.auxbin.pathTo(XC_SAVE), str(fd),
                str(dominfo.getDomid()), "0", "0", 
                str(int(live) | (int(hvm) << 2)) ]
-        log.debug("[xc_save]: %s", string.join(cmd))
 
         def saveInputHandler(line, tochild):
-            log.debug("In saveInputHandler %s", line)
             if line == "suspend":
-                log.debug("Suspending %d ...", dominfo.getDomid())
                 dominfo.shutdown('suspend')
+
+                # CoW timing
+                downtime.append(time.time())
+    
                 dominfo.waitForShutdown()
                 dominfo.migrateDevices(network, dst, DEV_MIGRATE_STEP2,
                                        domain_name)
-                log.info("Domain %d suspended.", dominfo.getDomid())
                 dominfo.migrateDevices(network, dst, DEV_MIGRATE_STEP3,
                                        domain_name)
                 if hvm:
                     dominfo.image.saveDeviceModel()
 
+                    # for CoW purposes, get qemu-dm state
+	            qemu_fd = os.open("/var/lib/xen/qemu-save.%d" % dominfo.getDomid(), os.O_RDONLY)
+	            while True:
+	                buf = os.read(qemu_fd, dm_batch)
+	                if len(buf):
+	                    buf_list.append(buf)
+	                else:
+	                    break
+	            os.close(qemu_fd)
+
+                # Cow: snapshot VBD
+                os.system("/etc/xen/scripts/snapshot-vbd.sh %s" % 
+                          os.path.basename(dst))
+                log.debug('Performed VBD snapshot')
+
                 tochild.write("done\n")
                 tochild.flush()
-                log.debug('Written done')
+
+            if line == "restart":
+                global down_end
+
+                log.debug("Restarting %d ...", dominfo.getDomid())
+                dominfo.resumeDomain(downtime)
+
+                # CoW timing
+                downtime.append(time.time())
+
+                tochild.write("done\n")
+                tochild.flush()
 
         forkHelper(cmd, fd, saveInputHandler, False)
 
         # put qemu device model state
         if os.path.exists("/var/lib/xen/qemu-save.%d" % dominfo.getDomid()):
+            os.remove("/var/lib/xen/qemu-save.%d" % dominfo.getDomid())
             write_exact(fd, QEMU_SIGNATURE, "could not write qemu signature")
-            qemu_fd = os.open("/var/lib/xen/qemu-save.%d" % dominfo.getDomid(),
-                              os.O_RDONLY)
-            while True:
-                buf = os.read(qemu_fd, dm_batch)
+            for buf in buf_list:
                 if len(buf):
                     write_exact(fd, buf, "could not write device model state")
                 else:
                     break
-            os.close(qemu_fd)
-            os.remove("/var/lib/xen/qemu-save.%d" % dominfo.getDomid())
-
-        if checkpoint:
-            dominfo.resumeDomain()
-        else:
-            dominfo.destroyDomain()
-            dominfo.testDeviceComplete()
         try:
             dominfo.setName(domain_name)
         except VmError:
@@ -136,10 +162,16 @@ def save(fd, dominfo, network, live, dst, checkpoint=False):
             # conflict.  This needs more thought.
             pass
 
+        # CoW timing
+        checkpointtime.append(time.time())
+        log.debug("[downtime] %s", downtime[2] - downtime[0])
+        log.debug("[checkpoint_time] %s", 
+				  checkpointtime[1] - checkpointtime[0])
+
     except Exception, exn:
         log.exception("Save failed on domain %s (%s) - resuming.", domain_name,
                       dominfo.getDomid())
-        dominfo.resumeDomain()
+        dominfo.resumeDomain([])
  
         try:
             dominfo.setName(domain_name)

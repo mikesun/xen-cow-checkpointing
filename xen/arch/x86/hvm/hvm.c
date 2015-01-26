@@ -953,6 +953,8 @@ static void *hvm_map_entry(unsigned long va)
 
     ASSERT(mfn_valid(mfn));
 
+    /* Do CoW before write occurs */
+    cow_copy_page(current->domain, mfn);
     paging_mark_dirty(current->domain, mfn);
 
     return (char *)map_domain_page(mfn) + (va & ~PAGE_MASK);
@@ -1331,6 +1333,8 @@ static enum hvm_copy_result __hvm_copy(
 
         if ( dir )
         {
+            /* Do CoW before write occurs */
+            cow_copy_page(curr->domain, mfn);
             memcpy(p, buf, count); /* dir == TRUE:  *to* guest */
             paging_mark_dirty(curr->domain, mfn);
         }

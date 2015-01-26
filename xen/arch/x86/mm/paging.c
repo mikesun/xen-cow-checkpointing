@@ -52,50 +52,6 @@
 #undef page_to_mfn
 #define page_to_mfn(_pg) (_mfn((_pg) - frame_table))
 
-/* The log-dirty lock.  This protects the log-dirty bitmap from
- * concurrent accesses (and teardowns, etc).
- *
- * Locking discipline: always acquire shadow or HAP lock before this one.
- *
- * Because mark_dirty is called from a lot of places, the log-dirty lock
- * may be acquired with the shadow or HAP locks already held.  When the
- * log-dirty code makes callbacks into HAP or shadow code to reset
- * various traps that will trigger the mark_dirty calls, it must *not*
- * have the log-dirty lock held, or it risks deadlock.  Because the only
- * purpose of those calls is to make sure that *guest* actions will
- * cause mark_dirty to be called (hypervisor actions explictly call it
- * anyway), it is safe to release the log-dirty lock before the callback
- * as long as the domain is paused for the entire operation. */
-
-#define log_dirty_lock_init(_d)                                   \
-    do {                                                          \
-        spin_lock_init(&(_d)->arch.paging.log_dirty.lock);        \
-        (_d)->arch.paging.log_dirty.locker = -1;                  \
-        (_d)->arch.paging.log_dirty.locker_function = "nobody";   \
-    } while (0)
-
-#define log_dirty_lock(_d)                                                   \
-    do {                                                                     \
-        if (unlikely((_d)->arch.paging.log_dirty.locker==current->processor))\
-        {                                                                    \
-            printk("Error: paging log dirty lock held by %s\n",              \
-                   (_d)->arch.paging.log_dirty.locker_function);             \
-            BUG();                                                           \
-        }                                                                    \
-        spin_lock(&(_d)->arch.paging.log_dirty.lock);                        \
-        ASSERT((_d)->arch.paging.log_dirty.locker == -1);                    \
-        (_d)->arch.paging.log_dirty.locker = current->processor;             \
-        (_d)->arch.paging.log_dirty.locker_function = __func__;              \
-    } while (0)
-
-#define log_dirty_unlock(_d)                                              \
-    do {                                                                  \
-        ASSERT((_d)->arch.paging.log_dirty.locker == current->processor); \
-        (_d)->arch.paging.log_dirty.locker = -1;                          \
-        (_d)->arch.paging.log_dirty.locker_function = "nobody";           \
-        spin_unlock(&(_d)->arch.paging.log_dirty.lock);                   \
-    } while (0)
-
 static mfn_t paging_new_log_dirty_page(struct domain *d, void **mapping_p)
 {
     mfn_t mfn;
@@ -258,7 +214,8 @@ int paging_log_dirty_disable(struct domain *d)
 }
 
 /* Mark a page as dirty */
-void paging_mark_dirty(struct domain *d, unsigned long guest_mfn)
+void _paging_mark_dirty(struct domain *d, unsigned long guest_mfn, 
+                        int do_locking)
 {
     unsigned long pfn;
     mfn_t gmfn;
@@ -272,7 +229,8 @@ void paging_mark_dirty(struct domain *d, unsigned long guest_mfn)
     if ( !paging_mode_log_dirty(d) || !mfn_valid(gmfn) )
         return;
 
-    log_dirty_lock(d);
+    if (do_locking)
+        log_dirty_lock(d);
 
     ASSERT(mfn_valid(d->arch.paging.log_dirty.top));
 
@@ -331,7 +289,8 @@ void paging_mark_dirty(struct domain *d, unsigned long guest_mfn)
     }
 
  out:
-    log_dirty_unlock(d);
+    if (do_locking)
+        log_dirty_unlock(d);
 }
 
 /* Read a domain's log-dirty bitmap and stats.  If the operation is a CLEAN,
@@ -371,6 +330,7 @@ int paging_log_dirty_op(struct domain *d, struct xen_domctl_shadow_op *sc)
     if ( (peek || clean) && !mfn_valid(d->arch.paging.log_dirty.top) )
     {
         rv = -EINVAL; /* perhaps should be ENOMEM? */
+        printk("CoW: -EINVAL\n");
         goto out;
     }
 
@@ -378,6 +338,7 @@ int paging_log_dirty_op(struct domain *d, struct xen_domctl_shadow_op *sc)
         printk("%s: %d failed page allocs while logging dirty pages\n",
                __FUNCTION__, d->arch.paging.log_dirty.failed_allocs);
         rv = -ENOMEM;
+        printk("CoW: -ENOMEM\n");
         goto out;
     }
 
@@ -410,6 +371,7 @@ int paging_log_dirty_op(struct domain *d, struct xen_domctl_shadow_op *sc)
                     if ( copy_to_guest_offset(sc->dirty_bitmap, pages >> 3,
                                               l1, bytes) != 0 )
                     {
+                        printk("CoW: -EFAULT\n");
                         rv = -EFAULT;
                         goto out;
                     }

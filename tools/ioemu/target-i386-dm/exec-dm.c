@@ -42,7 +42,35 @@
 
 /* make various TB consistency checks */
 //#define DEBUG_TB_CHECK 
-//#define DEBUG_TLB_CHECK 
+//#define DEBUG_TLB_CHECK
+
+#define BITS_PER_LONG (sizeof(unsigned long) * 8)
+#define BITS_TO_LONGS(bits) (((bits)+BITS_PER_LONG-1)/BITS_PER_LONG)
+#define BITMAP_SIZE   (BITS_TO_LONGS(logdirty_bitmap_size) * sizeof(unsigned long))
+
+#define BITMAP_ENTRY(_nr,_bmap) \
+   ((volatile unsigned long *)(_bmap))[(_nr)/BITS_PER_LONG]
+
+#define BITMAP_SHIFT(_nr) ((_nr) % BITS_PER_LONG)
+
+static inline int test_bit (int nr, volatile void * addr)
+{
+    return (BITMAP_ENTRY(nr, addr) >> BITMAP_SHIFT(nr)) & 1;
+}
+
+static inline void clear_bit (int nr, volatile void * addr)
+{
+    BITMAP_ENTRY(nr, addr) &= ~(1UL << BITMAP_SHIFT(nr));
+}
+
+static inline void set_bit ( int nr, volatile void * addr)
+{
+    BITMAP_ENTRY(nr, addr) |= (1UL << BITMAP_SHIFT(nr));
+}
+
+#define HVM_BELOW_4G_RAM_END        0xF0000000
+#define HVM_BELOW_4G_MMIO_START     HVM_BELOW_4G_RAM_END
+#define HVM_BELOW_4G_MMIO_LENGTH    ((1ULL << 32) - HVM_BELOW_4G_MMIO_START)
 
 #ifndef CONFIG_DM
 /* threshold to flush the translated code buffer */
@@ -417,6 +445,7 @@ int iomem_index(target_phys_addr_t addr)
 #define phys_ram_addr(x) (((x) < ram_size) ? (phys_ram_base + (x)) : NULL)
 #endif
 
+extern unsigned long *cow_bitmap;
 extern unsigned long *logdirty_bitmap;
 extern unsigned long logdirty_bitmap_size;
 
@@ -517,6 +546,30 @@ void cpu_physical_memory_rw(target_phys_addr_t addr, uint8_t *buf,
                     l = 1;
                 }
             } else if ((ptr = phys_ram_addr(addr)) != NULL) {
+                /* CoW here */
+                if (logdirty_bitmap != NULL)
+                {
+                    unsigned long pfn = addr >> TARGET_PAGE_BITS;
+                    if (!((pfn >= 0xa0 && pfn < 0xc0) /* VGA hole */
+                           || (pfn >= (HVM_BELOW_4G_MMIO_START >> PAGE_SHIFT)
+                               && pfn < (1ULL<<32) >> PAGE_SHIFT)) /* MMIO */
+                        && !test_bit(pfn, logdirty_bitmap)
+                        && !test_bit(pfn, cow_bitmap))
+                    {
+                        xc_cow_shadow_control(xc_handle, 
+                                              domid, 
+                                              XEN_DOMCTL_SHADOW_COW_COPY,
+                                              NULL,
+                                              NULL,
+                                              NULL,
+                                              NULL,
+                                              cow_bitmap,
+                                              0,
+                                              addr >> TARGET_PAGE_BITS,
+                                              0);
+                    }
+                }
+
                 /* Writing to RAM */
                 memcpy_words(ptr, buf, l);
                 if (logdirty_bitmap != NULL) {
@@ -526,8 +579,7 @@ void cpu_physical_memory_rw(target_phys_addr_t addr, uint8_t *buf,
                         fprintf(logfile, "dirtying pfn %lx >= bitmap "
                                 "size %lx\n", pfn, logdirty_bitmap_size * 8);
                     } else {
-                        logdirty_bitmap[pfn / HOST_LONG_BITS]
-                            |= 1UL << pfn % HOST_LONG_BITS;
+                        set_bit(pfn, logdirty_bitmap);
                     }
                 }
 #ifdef __ia64__
